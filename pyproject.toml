@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "svi-localvol"
+version = "0.1.0"
+description = "SVI-JW implied-volatility surface and Dupire local-volatility calibration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.7"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+svi-localvol = "svi_localvol.solution:cli"
+svi-alpha-preflight = "svi_localvol.research:cli"
+
+[tool.setuptools]
+packages = ["svi_localvol"]
