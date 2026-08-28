@@ -1,10 +1,10 @@
-"""Pre-Step-1 boundary for the dynamic-alpha hedging research.
+"""Preflight boundary for the dynamic-alpha hedging study.
 
 This module intentionally does not estimate beta, fit a model or run a hedge.
 It makes the research inputs and conventions explicit, audits the pickle, and
 checks that the existing SVI pipeline can calibrate every observation under a
-declared repair policy.  New research code should enter through this module or
-``dataset.py`` and use only the document's alpha convention.
+declared repair policy.  Later stages enter through this module and
+``data_loader.py`` and use only the document's alpha convention.
 """
 
 from __future__ import annotations
@@ -19,62 +19,12 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
-from .conventions import is_biz_day, to_date, us_equity_scheduled_holidays
-from .dataset import (REQUIRED_QUOTE_FIELDS, MarketConventions,
-                      SurfaceHistory, load_quote_file, load_surface_history)
-from .params import (ALPHA_STICKY_LOCAL_VOL, ALPHA_STICKY_MONEYNESS,
-                     ALPHA_STICKY_STRIKE, HEDGING_STRIKE_LEVELS,
-                     validate_stickiness_alpha)
+from svi_localvol.conventions import is_biz_day, to_date
+from svi_localvol.params import ALPHA_STICKY_STRIKE, validate_stickiness_alpha
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DATA_PATH = PROJECT_ROOT / "svi_data.pkl"
-RESEARCH_TENORS: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
-
-
-@dataclass(frozen=True)
-class DynamicAlphaConfig:
-    """Every convention that must be frozen before research Step 1."""
-
-    data_path: Path = DEFAULT_DATA_PATH
-    rate: float = 0.036
-    dividend: float = 0.03
-    repo: float = 0.0
-    holidays: tuple[dt.date, ...] = field(default_factory=lambda:
-        us_equity_scheduled_holidays(2024, 2030))
-    holiday_calendar_name: str = "scheduled US equity holidays (no one-offs)"
-    observation_date_shift: int = 0
-    roll_observation_dates: bool = False
-    require_business_observation_dates: bool = True
-    beta_clamp: float = 0.0
-    expiry_axis: str = "constant_tau"
-    tenors: tuple[float, ...] = RESEARCH_TENORS
-    strike_levels: tuple[float, ...] = tuple(float(x) for x in HEDGING_STRIKE_LEVELS)
-    level_anchor: str = "spot"
-    extrapolation: str = "nan"
-
-    def __post_init__(self):
-        object.__setattr__(self, "data_path", Path(self.data_path))
-        if self.expiry_axis != "constant_tau":
-            raise ValueError("dynamic-alpha research must use constant_tau across days")
-        if self.level_anchor != "spot":
-            raise ValueError("the research strike grid is K = level * refSpot")
-        if self.extrapolation != "nan":
-            raise ValueError("research inputs must mark, not silently fill, tenor extrapolation")
-        if self.beta_clamp < 0:
-            raise ValueError("beta_clamp must be non-negative")
-        if not self.tenors or min(self.tenors) <= 0:
-            raise ValueError("tenors must be strictly positive")
-        if not self.strike_levels or min(self.strike_levels) <= 0:
-            raise ValueError("strike levels must be strictly positive")
-        # Pin the document's alpha anchors at the boundary.
-        for alpha in (ALPHA_STICKY_LOCAL_VOL, ALPHA_STICKY_STRIKE,
-                      ALPHA_STICKY_MONEYNESS):
-            validate_stickiness_alpha(alpha)
-
-    @property
-    def market_conventions(self) -> MarketConventions:
-        return MarketConventions(rate=self.rate, dividend=self.dividend,
-                                 repo=self.repo, holidays=self.holidays)
+from .config import DEFAULT_DATA_PATH, DynamicAlphaConfig
+from .data_loader import (REQUIRED_QUOTE_FIELDS, SurfaceHistory,
+                          load_quote_file, load_surface_history)
 
 
 @dataclass(frozen=True)

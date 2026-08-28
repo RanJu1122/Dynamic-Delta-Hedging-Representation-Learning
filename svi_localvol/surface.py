@@ -1,4 +1,4 @@
-"""The volatility surface: Step 1 calibration, Step 2 ImpliedVol, Step 3 localvol.
+"""SVI volatility surface, implied volatility and Dupire local volatility.
 
 A `VolSurface` owns
   * the market data (pricing date, rates, holidays, reference spot),
@@ -48,8 +48,7 @@ class VolSurface:
         calendar_repair
             False -- use the quoted slices as they are.  Where the quotes cross
                      in total variance, dw/dT < 0 and `local_vol` returns NaN.
-                     This is the mode Step 3 must run in: the task asks for the
-                     arbitrage to be flagged, not hidden.
+                     Use this mode for diagnostics so arbitrage is visible.
             True  -- make w non-decreasing in tau at every log-moneyness by a
                      running maximum over slices.  dw/dT >= 0 by construction,
                      so the local volatility exists everywhere.  Use this for
@@ -136,7 +135,7 @@ class VolSurface:
         return float(np.exp(-self.market.rate * self.tau_r(T)))
 
     # ------------------------------------------------------------------ #
-    # Step 2 core -- total variance in (y, tau)
+    # total variance in (y, tau)
     # ------------------------------------------------------------------ #
     def _locate(self, tau: float) -> tuple[str, int, int]:
         """Return ('flat'|'interp', idx_lo, idx_hi) for a volatility time."""
@@ -181,16 +180,14 @@ class VolSurface:
                     out[key] = np.take_along_axis(out[key], src, axis=0)
         return out
 
-    def total_variance(self, T, K, spot_adj: float = 0.0, spot: float | None = None,
-                       order: int = 0):
+    def total_variance(self, T, K, spot: float | None = None, order: int = 0):
         """Total implied variance w(y, tau) and, optionally, its derivatives.
 
         Returns a dict with keys 'w', 'tau', 'y' and, when order >= 1,
         'dw_dtau', 'dw_dy'; when order >= 2 also 'd2w_dy2'.
 
-        `spot_adj` shifts the surface in log-moneyness space (stickiness).
-        A positive spot_adj corresponds to the spot having moved up by
-        exp(spot_adj) relative to the reference spot the surface was fitted on.
+        Implied variance is always evaluated on the quoted surface.  Dynamic
+        alpha enters only the Dupire denominator in :meth:`local_vol`.
         """
         tau = self.tau_vol(T)
         if tau <= 0:
@@ -198,7 +195,7 @@ class VolSurface:
 
         y = np.asarray(self.log_moneyness(T, K, spot), dtype=float)
         scalar = (y.ndim == 0)
-        y_eval = np.atleast_1d(y) - spot_adj         # surface argument after the shift
+        y_eval = np.atleast_1d(y)
 
         cur = self._slice_curves(y_eval, order)
         mode, lo, hi = self._locate(tau)
@@ -238,28 +235,27 @@ class VolSurface:
         return out
 
     # ------------------------------------------------------------------ #
-    # Step 2 -- ImpliedVol(T, K)
+    # implied volatility
     # ------------------------------------------------------------------ #
-    def implied_vol(self, T, K, spot_adj: float = 0.0, spot: float | None = None):
+    def implied_vol(self, T, K, spot: float | None = None):
         """Black-Scholes implied volatility for any date T and strike(s) K.
 
         T need not be a VolDate.  Total variance is interpolated linearly on
         the dt_vol axis and extrapolated flat in volatility outside the quotes.
         """
-        res = self.total_variance(T, K, spot_adj=spot_adj, spot=spot, order=0)
+        res = self.total_variance(T, K, spot=spot, order=0)
         w = np.maximum(res["w"], 0.0)
         vol = np.sqrt(w / res["tau"])
         return float(vol) if np.isscalar(K) or np.ndim(K) == 0 else vol
 
-    def implied_total_variance(self, T, K, spot_adj: float = 0.0):
-        return self.total_variance(T, K, spot_adj=spot_adj, order=0)["w"]
+    def implied_total_variance(self, T, K):
+        return self.total_variance(T, K, order=0)["w"]
 
     # ------------------------------------------------------------------ #
-    # Step 3 -- localvol(T, K, spot_adj)
+    # Dupire local volatility
     # ------------------------------------------------------------------ #
     def local_vol(self, T, K, spot_adj: float = 0.0, spot: float | None = None,
-                  shift_mode: str = "denominator", return_diagnostics: bool = False,
-                  alpha: float | None = None):
+                  return_diagnostics: bool = False, alpha: float | None = None):
         """Dupire-Gatheral local volatility, same shape as K.
 
             sigma_loc^2 = (dw/dT) / D
@@ -282,31 +278,18 @@ class VolSurface:
         dt_vol axis by `alpha_at`.  Pass a float to override every expiry at
         once -- that is what the alpha sweep in the hedging study needs.
 
-        Measured on the shipped test surface (see `params.py`):
+        Measured on the calibration test surface:
         alpha = 0 reproduces the frozen-local-vol delta, alpha = 1 reproduces
         the sticky-strike Black-Scholes delta, alpha = 2 moves further toward
         sticky moneyness.
 
-        shift_mode
-        ----------
-        'denominator' : y_adj enters only the Dupire denominator, w and its
-                        derivatives are evaluated at the unshifted y.  This is
-                        the literal reading of both task statements and is the
-                        convention the alpha anchors above were measured in.
-        'surface'     : the whole surface is evaluated at y - alpha * spot_adj.
-                        A different interpolation family: it also reduces to
-                        the frozen-local-vol delta at alpha = 0, but reaches
-                        the analytic sticky-moneyness delta already at
-                        alpha = 1.  Kept for comparison, not the default.
+        The shift enters only the Dupire denominator, exactly as specified by
+        both project documents; the quoted implied surface is not shifted.
         """
-        if shift_mode not in ("denominator", "surface"):
-            raise ValueError("shift_mode must be 'denominator' or 'surface'")
-
         a = (self.alpha_at(T) if alpha is None
              else validate_stickiness_alpha(alpha))
         shift = a * float(spot_adj)
-        surface_shift = shift if shift_mode == "surface" else 0.0
-        res = self.total_variance(T, K, spot_adj=surface_shift, spot=spot, order=2)
+        res = self.total_variance(T, K, spot=spot, order=2)
 
         w = res["w"]
         dw_dT = res["dw_dtau"]
@@ -339,8 +322,6 @@ class VolSurface:
             return vol_loc, diag
         return vol_loc
 
-    #here ends step 3 and checked arbitrage conditions
-
     # ------------------------------------------------------------------ #
     # matrices
     # ------------------------------------------------------------------ #
@@ -348,8 +329,8 @@ class VolSurface:
         return gen_schedule(self.market.pricing_date, end, period=period,
                             bizconv="Following", hol=self.market.holidays)
 
-    def implied_vol_matrix(self, dates: Sequence[dt.date], levels: np.ndarray,
-                           spot_adj: float = 0.0) -> pd.DataFrame:
+    def implied_vol_matrix(self, dates: Sequence[dt.date],
+                           levels: np.ndarray) -> pd.DataFrame:
         levels = np.asarray(levels, dtype=float)
         K = levels * self.market.spot
         rows = []
@@ -357,14 +338,13 @@ class VolSurface:
         for T in dates:
             if self.tau_vol(T) <= 0:
                 continue
-            rows.append(np.atleast_1d(self.implied_vol(T, K, spot_adj=spot_adj)))
+            rows.append(np.atleast_1d(self.implied_vol(T, K)))
             idx.append(to_date(T))
         return pd.DataFrame(rows, index=pd.Index(idx, name="date"),
                             columns=pd.Index(levels, name="level"))
 
     def local_vol_matrix(self, dates: Sequence[dt.date], levels: np.ndarray,
                          spot_adj: float = 0.0,
-                         shift_mode: str = "denominator",
                          alpha: float | None = None) -> pd.DataFrame:
         levels = np.asarray(levels, dtype=float)
         K = levels * self.market.spot
@@ -373,8 +353,7 @@ class VolSurface:
             if self.tau_vol(T) <= 0:
                 continue
             rows.append(np.atleast_1d(
-                self.local_vol(T, K, spot_adj=spot_adj, shift_mode=shift_mode,
-                               alpha=alpha)))
+                self.local_vol(T, K, spot_adj=spot_adj, alpha=alpha)))
             idx.append(to_date(T))
         return pd.DataFrame(rows, index=pd.Index(idx, name="date"),
                             columns=pd.Index(levels, name="level"))
@@ -431,8 +410,6 @@ class VolSurface:
         df = pd.DataFrame(rows)
         df["pass"] = df.drop(columns=["VolDate"]).abs().max(axis=1) < tol
         return df
-    #step 1 ends here final check
-
     def arbitrage_report(self, y_grid: np.ndarray | None = None) -> dict:
         """Butterfly per slice, calendar crossedness between adjacent slices.
 

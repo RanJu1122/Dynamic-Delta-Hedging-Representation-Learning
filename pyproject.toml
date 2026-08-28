@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "svi-localvol"
 version = "0.1.0"
-description = "SVI-JW implied-volatility surface and Dupire local-volatility calibration"
+description = "Reusable SVI/local-vol engine with calibration and dynamic-alpha workflows"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,8 +19,11 @@ plots = ["matplotlib>=3.7"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]
-svi-localvol = "svi_localvol.solution:cli"
-svi-alpha-preflight = "svi_localvol.research:cli"
+svi-calibration = "pricing_svi_localvol_calibration.cli:cli"
+dynamic-alpha = "dynamic_alpha_hedging.cli:cli"
 
-[tool.setuptools]
-packages = ["svi_localvol"]
+[tool.setuptools.packages.find]
+include = ["svi_localvol*", "pricing_svi_localvol_calibration*", "dynamic_alpha_hedging*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

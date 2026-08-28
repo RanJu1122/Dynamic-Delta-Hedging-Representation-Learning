@@ -70,7 +70,7 @@ class SVIRaw:
 
 
 # --------------------------------------------------------------------------- #
-# Step 1 -- SVI-JW  ->  SVI-raw
+# SVI-JW -> SVI-raw
 # --------------------------------------------------------------------------- #
 def jw_to_raw(atm_var: float, skew: float, putwing: float, callwing: float,
               min_imp_var: float, tau: float,

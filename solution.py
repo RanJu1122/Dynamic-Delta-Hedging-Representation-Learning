@@ -5,8 +5,10 @@ here, while their implementation lives in the installable ``svi_localvol``
 package.
 """
 
-from svi_localvol.solution import (ImpliedVol, build_surface, cli, gen_schedule,
-                                   localvol, main, param_convert)
+from pricing_svi_localvol_calibration.cli import cli
+from pricing_svi_localvol_calibration.pipeline import main
+from pricing_svi_localvol_calibration.task_api import (
+    ImpliedVol, build_surface, gen_schedule, localvol, param_convert)
 
 __all__ = [
     "param_convert",

@@ -1,12 +1,14 @@
 """Daily SVI quote history -> surfaces -> implied volatility panels.
 
 This is the data layer the dynamic-alpha hedging study starts from.  It turns
-`svi_data.pkl` (one SVI-JW quote set per trading day) into
+``data/svi_data.pkl`` (one SVI-JW quote set per observation) into
 
     * one `VolSurface` per day, and
-    * the IV[t, i, j] panel the study's Step 1 asks for,
+    * a descriptive IV[t, i, j] panel on an explicit coordinate grid,
 
-and nothing else: no beta, no regression, no hedging.  Those are the study.
+and nothing else: no beta, no regression, no hedging.  Dynamic Step 1 must
+add fixed-contract day-over-day IV changes; a naive difference of panels whose
+strike is re-anchored to each day's spot is not an empirical stickiness label.
 
 Three conventions have to be pinned down before any of that, because they are
 not implied by the data and silently choosing wrong would poison every later
@@ -33,8 +35,10 @@ step.
                      jump is an artefact, not a volatility move.
       'constant_tau' a fixed Business/260 tenor grid, read off each day's own
                      surface.  Differences along t are then like-for-like.
-                     This is the right axis for measuring d(IV) against
-                     d(log S), which is what Step 2 does.
+                     This is the right rectangular axis for reporting and
+                     later cross-sectional factor analysis.  Fixed-contract
+                     dIV still requires evaluating adjacent surfaces at the
+                     same actual strike and expiry.
 
     `implied_vol_panel` defaults to 'constant_tau' for that reason and records
     which axis produced the panel.
@@ -51,9 +55,9 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-from .conventions import is_biz_day, nb_biz_days, roll, to_date
-from .params import MarketData, VolQuoteSet
-from .surface import VolSurface
+from svi_localvol.conventions import is_biz_day, nb_biz_days, roll, to_date
+from svi_localvol.params import MarketData, VolQuoteSet
+from svi_localvol.surface import VolSurface
 
 #: Tenor grid in years (Business/260) used by the 'constant_tau' expiry axis.
 DEFAULT_TENORS: np.ndarray = np.array([1 / 12, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0])
@@ -262,17 +266,6 @@ class ImpliedVolPanel:
         cols = pd.MultiIndex.from_product([self.expiries, self.levels],
                                           names=["expiry", "level"])
         return self.iv.reshape(t, -1), cols
-
-    def diff(self) -> np.ndarray:
-        """dIV[t, i, j] = IV[t] - IV[t-1], first row NaN.
-
-        Meaningful only because the expiry axis is like-for-like across days;
-        on the 'slot' axis a roll makes one row of this a comparison between
-        two different expiries.
-        """
-        out = np.full_like(self.iv, np.nan)
-        out[1:] = np.diff(self.iv, axis=0)
-        return out
 
     def coverage_frame(self) -> pd.DataFrame:
         """Per-expiry counts of observations read outside quoted maturities."""

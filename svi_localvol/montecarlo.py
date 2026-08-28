@@ -1,4 +1,4 @@
-"""Step 4 -- Monte Carlo under the calibrated local volatility surface.
+"""Monte Carlo primitives for a calibrated local-volatility surface.
 
 The engine is deliberately split in two:
 
@@ -13,7 +13,7 @@ TWO CLOCKS, TWO STEP SIZES
 --------------------------
 `VolSurface.local_vol` returns sqrt((dw/dtau) / D) where tau is dt_vol, the
 Business/260 clock.  Its units are therefore VARIANCE PER BUSINESS YEAR, not
-per calendar year.  The only thing the Black-Scholes leg of the Step 4 check
+per calendar year.  The only thing the Black-Scholes comparison leg
 reads is the total variance w, so the scheme is consistent if and only if
 
     integral of sigma_loc^2 over the simulation  ==  w(y, T)   exactly.
@@ -42,6 +42,7 @@ import pandas as pd
 
 from .blackscholes import bs_delta_w, bs_price_w
 from .conventions import to_date
+from .params import validate_stickiness_alpha
 from .surface import VolSurface
 
 
@@ -120,8 +121,7 @@ class LocalVolGrid:
     def build(cls, surface: VolSurface, maturity, n_ratio: int = 1000,
               ratio_max: float = 3.0, ratio_min: float = 1e-3,
               spot_adj: float = 0.0, vol_floor: float = 0.0,
-              vol_cap: float = 5.0, shift_mode: str = "denominator",
-              local_vol_fn: Callable | None = None,
+              vol_cap: float = 5.0, local_vol_fn: Callable | None = None,
               alpha: float | None = None) -> "LocalVolGrid":
         """Tabulate sigma_loc on (business day) x (spot ratio).
 
@@ -136,10 +136,8 @@ class LocalVolGrid:
         `ratio_min` because y = ln(K/F) is undefined at K = 0.
 
         local_vol_fn
-            Optional ``f(T, K) -> sigma_loc``.  Step 4 passes the delivered
-            module-level ``localvol`` here so that the grid is built through
-            exactly the function the task statement asks for.  When omitted the
-            surface's own method is used with `spot_adj` / `shift_mode`.
+            Optional ``f(T, K) -> sigma_loc`` adapter.  When omitted the
+            surface's own method is used with `spot_adj` and `alpha`.
 
         alpha
             Stickiness override forwarded to `VolSurface.local_vol`; `None`
@@ -154,10 +152,8 @@ class LocalVolGrid:
         K = np.maximum(ratios, ratio_min) * surface.market.spot
 
         if local_vol_fn is None:
-            def local_vol_fn(T, K, _s=surface, _a=spot_adj, _m=shift_mode,
-                             _al=alpha):
-                return _s.local_vol(T, K, spot_adj=_a, shift_mode=_m,
-                                    alpha=_al)
+            def local_vol_fn(T, K, _s=surface, _a=spot_adj, _al=alpha):
+                return _s.local_vol(T, K, spot_adj=_a, alpha=_al)
 
         raw = np.empty((len(dates), n_ratio))
         for i, T in enumerate(dates):
@@ -416,7 +412,7 @@ class LocalVolMC:
             res.extra["pv_dn"] = float(dn.mean())
         return res
 
-    def step4_diagnostics(self, strikes: Sequence[float], maturity,
+    def price_diagnostics(self, strikes: Sequence[float], maturity,
                           ratio_bin_edges: Sequence[float] | None = None
                           ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Price a strike grid and condition integrated variance on terminal spot.
@@ -552,14 +548,13 @@ class LocalVolMC:
             })
         return pricing, pd.DataFrame(bin_rows)
 
-    def step4_delta_diagnostics(self, strikes: Sequence[float], maturity,
-                                grid_up: LocalVolGrid,
-                                grid_down: LocalVolGrid,
-                                bump: float) -> pd.DataFrame:
+    def bump_delta_diagnostics(self, strikes: Sequence[float], maturity,
+                               grid_up: LocalVolGrid,
+                               grid_down: LocalVolGrid,
+                               bump: float) -> pd.DataFrame:
         """Compare BS, constant-implied-vol MC and bumped local-vol deltas.
 
-        This implements the Step 4 bump scope requested by the mentor.  The
-        up/down local-vol grids must be rebuilt before this call with
+        The up/down local-vol grids must be rebuilt before this call with
 
             spot_adj_up   = log((S0 + bump) / ref_spot)
             spot_adj_down = log((S0 - bump) / ref_spot)
@@ -614,7 +609,7 @@ class LocalVolMC:
             w_imp = sigma_imp ** 2 * tau_v
 
             # The BS/implied leg keeps the option's base implied volatility
-            # fixed under the 1% spot bump, as required by the Step 4 check.
+            # fixed under the spot bump for the calibration comparison.
             bs_delta = float(bs_delta_w(
                 F0, strike, w_imp, df, carry, is_call=True))
             bs_pv_up = float(bs_price_w(

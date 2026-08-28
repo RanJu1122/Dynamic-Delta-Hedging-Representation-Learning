@@ -1,34 +1,24 @@
-"""Regression tests.
-
-Run as a module (`python3 -m svi_localvol.tests`) or under pytest.
-Every check that the task statement calls a "self-check" lives here, plus the
-ones the statement does not ask for but that actually catch bugs.
-"""
+"""Unit and numerical-regression tests for the reusable core library."""
 
 from __future__ import annotations
 
 import datetime as dt
-from pathlib import Path
-
 import numpy as np
 
-from .blackscholes import (bs_delta_w, bs_price_w,
-                           implied_total_variance)
-from .conventions import (dt_r, dt_vol, gen_schedule, is_biz_day, nb_biz_days,
-                          us_equity_scheduled_holidays)
-from .dataset import (DEFAULT_TENORS, MarketConventions, implied_vol_panel,
-                      load_surface_history)
-from .deltas import (LOCAL_VOL_LIKE, STICKY_MONEYNESS, STICKY_STRIKE,
-                     R_from_alpha, alpha_from_R, alpha_mc_delta_curve, delta,
-                     delta_finite_difference, fit_backbone, smile_greeks)
-from .montecarlo import LocalVolGrid, LocalVolMC
-from .params import (ALPHA_STICKY_LOCAL_VOL, ALPHA_STICKY_MONEYNESS,
-                     ALPHA_STICKY_STRIKE, DEFAULT_STRIKE_LEVELS,
-                     HEDGING_STRIKE_LEVELS, TEST_MARKET,
-                     TEST_VOL_PARAMS, VolQuoteSet, validate_stickiness_alpha)
-from .research import DynamicAlphaConfig, run_preflight
-from .surface import VolSurface
-from .svi import g_function, jw_to_raw, raw_to_jw
+from pricing_svi_localvol_calibration.config import (
+    DEFAULT_STRIKE_LEVELS, TEST_MARKET, TEST_VOL_PARAMS)
+from svi_localvol.blackscholes import (bs_delta_w, bs_price_w,
+                                       implied_total_variance)
+from svi_localvol.conventions import (dt_r, dt_vol, gen_schedule, is_biz_day,
+                                      nb_biz_days,
+                                      us_equity_scheduled_holidays)
+from svi_localvol.montecarlo import LocalVolGrid, LocalVolMC
+from svi_localvol.params import (ALPHA_STICKY_LOCAL_VOL,
+                                 ALPHA_STICKY_MONEYNESS,
+                                 ALPHA_STICKY_STRIKE, VolQuoteSet,
+                                 validate_stickiness_alpha)
+from svi_localvol.surface import VolSurface
+from svi_localvol.svi import g_function, jw_to_raw, raw_to_jw
 
 SURF = VolSurface(TEST_MARKET, VolQuoteSet.from_dict(TEST_VOL_PARAMS))
 SURF_REP = SURF.repaired()
@@ -226,15 +216,7 @@ def test_spot_adj_shifts_the_smile():
 # --------------------------------------------------------------------------- #
 # stickiness parameter alpha  (dynamic-hedging study convention)
 # --------------------------------------------------------------------------- #
-def test_alpha_conventions_convert_both_ways():
-    assert alpha_from_R(STICKY_STRIKE) == ALPHA_STICKY_STRIKE
-    assert alpha_from_R(STICKY_MONEYNESS) == ALPHA_STICKY_MONEYNESS
-    assert alpha_from_R(LOCAL_VOL_LIKE) == ALPHA_STICKY_LOCAL_VOL
-    for a in (0.0, 0.5, 1.0, 1.5, 2.0):
-        assert abs(float(alpha_from_R(R_from_alpha(a))) - a) < 1e-15
-
-
-def test_alpha_boundary_rejects_old_R_values():
+def test_alpha_boundary_rejects_negative_values():
     assert validate_stickiness_alpha(0.0) == 0.0
     assert validate_stickiness_alpha(2.0) == 2.0
     try:
@@ -242,7 +224,7 @@ def test_alpha_boundary_rejects_old_R_values():
     except ValueError:
         pass
     else:
-        raise AssertionError("legacy R=-1 must not be accepted as research alpha")
+        raise AssertionError("negative stickiness alpha must be rejected")
 
 
 def test_alpha_comes_from_the_quotes_by_default():
@@ -283,11 +265,6 @@ def test_alpha_is_interpolated_between_voldates():
     assert surf.alpha_at(hi.vol_date) == 2.0
     mid = surf.alpha_at(dt.date(2026, 10, 2))               # between the two
     assert 0.0 < mid < 2.0
-
-
-def test_hedging_strike_levels_span_the_study_band():
-    assert HEDGING_STRIKE_LEVELS[0] == 0.40
-    assert HEDGING_STRIKE_LEVELS[-1] == 1.20
 
 
 # --------------------------------------------------------------------------- #
@@ -354,11 +331,11 @@ def test_path_integrated_variance_uses_the_volatility_clock():
     assert np.max(np.abs(integrated - target)) < 1e-14
 
 
-def test_step4_diagnostic_tables_are_complete():
+def test_price_diagnostic_tables_are_complete():
     grid = LocalVolGrid.build(SURF_REP, MATURITY)
     mc = LocalVolMC(SURF_REP, grid, n_paths=20_000, seed=37,
                     antithetic=True, n_substeps=2)
-    pricing, bins = mc.step4_diagnostics([0.9, 1.0, 1.1], MATURITY)
+    pricing, bins = mc.price_diagnostics([0.9, 1.0, 1.1], MATURITY)
 
     assert pricing.shape[0] == 3
     assert {"bs_pv", "mc_implied_pv", "mc_local_pv",
@@ -374,7 +351,7 @@ def test_step4_diagnostic_tables_are_complete():
     assert np.isfinite(bins["mean_path_integrated_variance"]).all()
 
 
-def test_step4_mentor_delta_table_is_complete():
+def test_bump_delta_table_is_complete():
     """The delta check must rebuild its up/down local-vol grids."""
     h = 0.01 * SURF_REP.market.spot
     base = LocalVolGrid.build(SURF_REP, MATURITY, n_ratio=300)
@@ -388,7 +365,7 @@ def test_step4_mentor_delta_table_is_complete():
 
     mc = LocalVolMC(SURF_REP, base, n_paths=20_000, seed=37,
                     antithetic=True, n_substeps=2)
-    table = mc.step4_delta_diagnostics(
+    table = mc.bump_delta_diagnostics(
         [0.9, 1.0, 1.1], MATURITY, up, down, bump=h)
 
     required = {
@@ -477,184 +454,3 @@ def test_substep_refinement_has_converged():
     gap = abs(out[1][0] - out[0][0])
     combined = float(np.hypot(out[0][1], out[1][1]))
     assert gap < 4 * combined, f"gap {gap:.2e} vs 4 sigma {4 * combined:.2e}"
-
-
-# --------------------------------------------------------------------------- #
-# Step 5 -- deltas
-# --------------------------------------------------------------------------- #
-def test_closed_form_delta_matches_bump_and_reprice():
-    for R in (LOCAL_VOL_LIKE, STICKY_STRIKE, 0.5, STICKY_MONEYNESS):
-        for K in (0.9, 1.0, 1.1):
-            a = float(np.atleast_1d(
-                delta(SURF_REP, MATURITY, K, 1.0, R))[0])
-            b = float(np.atleast_1d(
-                delta_finite_difference(SURF_REP, MATURITY, K, 1.0, R))[0])
-            assert abs(a - b) < 1e-6
-
-
-def test_sticky_strike_delta_equals_bs_delta():
-    g = smile_greeks(SURF_REP, MATURITY, 1.0, 1.0, STICKY_STRIKE)
-    assert abs(float(np.atleast_1d(g["delta"])[0])
-               - float(np.atleast_1d(g["delta_bs"])[0])) < 1e-14
-
-
-def test_delta_is_monotone_in_stickiness_for_negative_skew():
-    ds = [float(np.atleast_1d(delta(SURF_REP, MATURITY, 1.0, 1.0, R))[0])
-          for R in (-1.0, -0.5, 0.0, 0.5, 1.0)]
-    assert all(b > a for a, b in zip(ds, ds[1:]))
-
-
-def test_backtest_recovers_the_true_stickiness():
-    """The hedging objective must point back at the R that generated the path."""
-    from . import backtest as bt
-
-    R_grid = np.round(np.arange(-1.0, 1.51, 0.25), 3)
-    for R_true in (0.0, 1.0):
-        states = bt.simulate_states_from_local_vol(
-            SURF_REP, MATURITY, seed=11, stickiness_truth=R_true)
-        engine = bt.HedgeBacktester(
-            states, bt.OptionSpec(strike=1.0, maturity=MATURITY))
-        tbl = engine.sweep(R_grid)
-        best = float(tbl.loc[tbl["pnl_mad"].idxmin(), "stickiness"])
-        assert abs(best - R_true) <= 0.25
-
-
-def test_rolled_surface_reprices_todays_smile():
-    """Rolling to t=0 with any R must leave the surface unchanged."""
-    from . import backtest as bt
-
-    K = np.array([0.9, 1.0, 1.1])
-    for R in (0.0, 0.5, 1.0):
-        rolled = bt.roll_surface(SURF_REP, SURF_REP.market.pricing_date,
-                                 SURF_REP.market.spot, R)
-        assert np.max(np.abs(rolled.implied_vol(MATURITY, K)
-                             - SURF_REP.implied_vol(MATURITY, K))) < 1e-12
-
-
-def test_backbone_fit_recovers_stickiness():
-    rng = np.random.default_rng(0)
-    skew, R_true = -0.35, 0.4
-    x = rng.normal(0, 0.01, 500)
-    y = (1 - R_true) * skew * x + rng.normal(0, 1e-5, 500)
-    fit = fit_backbone(x, y, skew)
-    assert abs(fit.implied_stickiness - R_true) < 0.05
-
-
-
-
-# --------------------------------------------------------------------------- #
-# daily quote history -> surfaces -> IV panel  (hedging study data layer)
-# --------------------------------------------------------------------------- #
-_QUOTE_FILE = Path(__file__).resolve().parent.parent / "svi_data.pkl"
-
-
-def test_alpha_delta_curve_is_a_thin_wrapper():
-    """One row per (alpha, strike), delegating to the Step 4 engine."""
-    tbl = alpha_mc_delta_curve(SURF_REP, [1.0], MATURITY,
-                               alphas=(0.0, 1.0),
-                               n_paths=2_000, n_substeps=1)
-    assert list(tbl["alpha"]) == [0.0, 1.0]
-    assert "stickiness_R" not in tbl.columns
-    for col in ("mc_local_delta", "mc_local_delta_stderr", "bs_delta_bump"):
-        assert col in tbl.columns
-
-
-def test_quote_file_loads_into_surfaces():
-    if not _QUOTE_FILE.exists():
-        return                                    # data file is optional
-    hist = load_surface_history(_QUOTE_FILE, MarketConventions())
-    assert len(hist) > 0
-    assert set(hist.skipped.columns) == {"date", "n_slices", "reason"}
-    d = hist.dates[-1]
-    assert hist[d].market.pricing_date == d
-    assert hist[d].ref_spot == hist.spots[d]      # refSpot IS that day's close
-
-
-def test_beta_clamp_recovers_the_non_convex_days():
-    if not _QUOTE_FILE.exists():
-        return
-    strict = load_surface_history(_QUOTE_FILE, MarketConventions())
-    lenient = load_surface_history(_QUOTE_FILE, MarketConventions(),
-                                   beta_clamp=0.05)
-    assert len(lenient) >= len(strict)
-    assert len(lenient.skipped) <= len(strict.skipped)
-
-
-def test_implied_vol_panel_axes():
-    if not _QUOTE_FILE.exists():
-        return
-    hist = load_surface_history(_QUOTE_FILE, MarketConventions(),
-                               dates=None, beta_clamp=0.05)
-    sub = load_surface_history(_QUOTE_FILE, MarketConventions(),
-                               dates=hist.dates[:20], beta_clamp=0.05)
-    panel = implied_vol_panel(sub, HEDGING_STRIKE_LEVELS)
-    assert panel.shape == (len(sub), len(DEFAULT_TENORS),
-                           len(HEDGING_STRIKE_LEVELS))
-    assert panel.expiry_axis == "constant_tau"
-    assert np.isfinite(panel.iv).all()
-    flat, cols = panel.flattened()
-    assert flat.shape == (len(sub), len(DEFAULT_TENORS) * len(HEDGING_STRIKE_LEVELS))
-    assert len(cols) == flat.shape[1]
-    d = panel.diff()
-    assert np.isnan(d[0]).all() and np.isfinite(d[1:]).all()
-
-
-def test_constant_tau_axis_is_like_for_like():
-    """Every day must be read at the SAME tenors, whatever its quoted expiries."""
-    if not _QUOTE_FILE.exists():
-        return
-    hist = load_surface_history(_QUOTE_FILE, MarketConventions(),
-                                beta_clamp=0.05)
-    sub = load_surface_history(_QUOTE_FILE, MarketConventions(),
-                               dates=hist.dates[:10], beta_clamp=0.05)
-    panel = implied_vol_panel(sub, np.array([0.9, 1.0, 1.1]))
-    for a, d in enumerate(panel.dates):
-        surf = sub[d]
-        for b, tenor in enumerate(panel.expiries):
-            got = surf.tau_vol(panel.vol_dates[a, b])
-            assert abs(got - tenor) <= 1.5 / 260.0
-
-
-def test_research_panel_marks_extrapolation_instead_of_flat_filling():
-    if not _QUOTE_FILE.exists():
-        return
-    hist = load_surface_history(_QUOTE_FILE, MarketConventions(),
-                                beta_clamp=0.05)
-    sub = load_surface_history(_QUOTE_FILE, MarketConventions(),
-                               dates=hist.dates[:5], beta_clamp=0.05)
-    panel = implied_vol_panel(sub, np.array([1.0]), tenors=(1 / 260, 0.5),
-                              extrapolation="nan")
-    assert panel.extrapolated[:, 0].all()
-    assert np.isnan(panel.iv[:, 0]).all()
-    assert panel.coverage_frame().loc[0, "n_extrapolated"] == len(sub)
-
-
-def test_dynamic_alpha_preflight_detects_unresolved_observation_dates():
-    if not _QUOTE_FILE.exists():
-        return
-    report = run_preflight(DynamicAlphaConfig(data_path=_QUOTE_FILE))
-    assert report.audit.alpha_values == (1.0,)
-    assert len(report.audit.non_business_dates) > 0
-    assert not report.ready_for_step1
-    assert len(report.prepared_history) == report.audit.n_records
-
-
-# --------------------------------------------------------------------------- #
-def _run_all():
-    fns = [(n, f) for n, f in sorted(globals().items())
-           if n.startswith("test_") and callable(f)]
-    width = max(len(n) for n, _ in fns)
-    failed = 0
-    for name, fn in fns:
-        try:
-            fn()
-            print(f"  PASS  {name:<{width}}")
-        except Exception as exc:                       # noqa: BLE001
-            failed += 1
-            print(f"  FAIL  {name:<{width}}  {type(exc).__name__}: {exc}")
-    print(f"\n{len(fns) - failed}/{len(fns)} passed")
-    return failed
-
-
-if __name__ == "__main__":
-    raise SystemExit(1 if _run_all() else 0)

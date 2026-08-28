@@ -1,4 +1,4 @@
-"""Optional plots: implied and local volatility surfaces over (strike, T).
+"""Optional plots for the pricing SVI/local-vol calibration workflow.
 
 Kept out of the calculation path -- import failures here must never break
 `solution.py`.
@@ -87,42 +87,6 @@ def plot_smile_slices(surface, dates, levels, path="output/smiles.png"):
         ax.set_title(name)
         ax.grid(alpha=0.3)
     axes[1].legend(fontsize=7)
-    fig.tight_layout()
-    fig.savefig(path, dpi=130)
-    plt.close(fig)
-    return path
-
-
-def plot_delta_range(surface, maturity, levels, path="output/delta_range.png",
-                     stickiness_grid=(-1.0, 0.0, 1.0)):
-    """Delta across strikes for several stickiness assumptions."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception:                                       # noqa: BLE001
-        return None
-    from .deltas import delta
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    K = np.asarray(levels, dtype=float) * surface.market.spot
-
-    fig, ax = plt.subplots(figsize=(7, 4.4))
-    curves = {}
-    for R in stickiness_grid:
-        d = np.atleast_1d(delta(surface, maturity, K, surface.market.spot, R))
-        curves[R] = d
-        ax.plot(levels, d, marker="o", ms=3,
-                label=f"R = {R:+.1f}")
-    lo = np.min(np.vstack(list(curves.values())), axis=0)
-    hi = np.max(np.vstack(list(curves.values())), axis=0)
-    ax.fill_between(levels, lo, hi, alpha=0.15, color="grey")
-    ax.set_xlabel("strike level  K / S0")
-    ax.set_ylabel("delta")
-    ax.set_title(f"delta range across stickiness, T = {maturity}")
-    ax.grid(alpha=0.3)
-    ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
