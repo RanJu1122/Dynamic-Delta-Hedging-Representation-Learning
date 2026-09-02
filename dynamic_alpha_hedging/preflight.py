@@ -71,6 +71,11 @@ class PreflightReport:
             f"extrapolation={self.config.extrapolation}",
             f"rates: r={self.config.rate:g}, q={self.config.dividend:g}, "
             f"repo={self.config.repo:g}; calendar={self.config.holiday_calendar_name}",
+            f"timestamp mapping: {self.config.source_timezone} -> "
+            f"{self.config.market_timezone}; date-only keys pass through",
+            "observation-date contract: Monday-Friday market dates",
+            f"duplicate VolDate policy: {self.config.duplicate_vol_date_policy}; "
+            f"allow skipped surfaces={self.config.allow_skipped_surfaces}",
             f"stored non-business observation dates: {len(a.non_business_dates)}",
             f"records whose VolDate arrays needed aligned sorting: "
             f"{len(a.unsorted_vol_date_records)}",
@@ -107,9 +112,8 @@ def audit_quote_file(config: DynamicAlphaConfig) -> QuoteAudit:
     """Schema and calendar audit; no SVI calibration and no research output."""
     records = load_quote_file(
         config.data_path,
-        observation_date_shift=config.observation_date_shift,
-        roll_observation_dates=config.roll_observation_dates,
-        holidays=config.holidays,
+        source_timezone=config.source_timezone,
+        market_timezone=config.market_timezone,
     )
     malformed: list[dict] = []
     quote_counts: set[int] = set()
@@ -134,8 +138,33 @@ def audit_quote_file(config: DynamicAlphaConfig) -> QuoteAudit:
         if vol_dates != sorted(vol_dates):
             unsorted.append(date)
         if len(set(vol_dates)) != n:
-            malformed.append({"date": date, "issue": "duplicate_vol_date",
-                              "detail": str(n - len(set(vol_dates)))})
+            quote_fields = ("ATMVol", "Skew", "Putwing", "Callwing", "Kurt",
+                            "StickinessRatio")
+            groups: dict[dt.date, list[int]] = {}
+            for index, expiry in enumerate(vol_dates):
+                groups.setdefault(expiry, []).append(index)
+            conflicts = 0
+            for indices in groups.values():
+                if len(indices) < 2:
+                    continue
+                first = np.asarray(
+                    [record[field][indices[0]] for field in quote_fields],
+                    dtype=float)
+                if any(not np.array_equal(
+                        first,
+                        np.asarray([record[field][index] for field in quote_fields],
+                                   dtype=float),
+                        equal_nan=True)
+                       for index in indices[1:]):
+                    conflicts += 1
+            issue = ("conflicting_duplicate_vol_date" if conflicts
+                     else "exact_duplicate_vol_date")
+            malformed.append({
+                "date": date,
+                "issue": issue,
+                "detail": (f"{n - len(set(vol_dates))} duplicate row(s); "
+                           f"{conflicts} conflicting maturity group(s)"),
+            })
         if any(expiry <= date for expiry in vol_dates):
             malformed.append({"date": date, "issue": "expired_vol_date",
                               "detail": "VolDate must be after observation"})
@@ -200,13 +229,34 @@ def run_preflight(config: DynamicAlphaConfig = DynamicAlphaConfig()) -> Prefligh
         return PreflightReport(config, empty, None, None, coverage,
                                [f"quote audit failed: {type(exc).__name__}: {exc}"], [])
 
-    if not audit.malformed.empty:
-        blockers.append(f"{len(audit.malformed)} malformed quote record(s)")
-    if config.require_business_observation_dates and audit.non_business_dates:
+    duplicate_issues = audit.malformed[
+        audit.malformed["issue"].isin(("exact_duplicate_vol_date",
+                                       "conflicting_duplicate_vol_date"))]
+    hard_malformed = audit.malformed.drop(duplicate_issues.index)
+    if not hard_malformed.empty:
+        blockers.append(f"{len(hard_malformed)} malformed quote record(s)")
+    if not duplicate_issues.empty:
+        exact_count = int((duplicate_issues["issue"]
+                           == "exact_duplicate_vol_date").sum())
+        conflict_count = int((duplicate_issues["issue"]
+                              == "conflicting_duplicate_vol_date").sum())
+        warnings.append(
+            f"duplicate VolDates on {len(duplicate_issues)} day(s): "
+            f"{exact_count} exact, {conflict_count} conflicting; configured "
+            f"policy={config.duplicate_vol_date_policy!r}")
+        if config.duplicate_vol_date_policy == "error":
+            blockers.append("duplicate VolDates require an explicit resolution policy")
+    weekend_dates = tuple(d for d in audit.non_business_dates if d.weekday() >= 5)
+    weekday_non_business = tuple(
+        d for d in audit.non_business_dates if d.weekday() < 5)
+    if config.require_weekday_observations and weekend_dates:
         blockers.append(
-            f"{len(audit.non_business_dates)} observation keys are not business "
-            "dates under the declared calendar; confirm source timestamp semantics "
-            "before computing dlogS/dIV")
+            f"{len(weekend_dates)} observation keys fall on weekends; the input "
+            "contract requires Monday-Friday market dates")
+    if weekday_non_business:
+        warnings.append(
+            f"{len(weekday_non_business)} weekday observation keys are exchange "
+            "holidays under the configured calendar; confirm the replacement data")
     if audit.alpha_values != (ALPHA_STICKY_STRIKE,):
         warnings.append("input StickinessRatio is not uniformly alpha=1; inspect "
                         "whether the file already contains a dynamic policy")
@@ -214,7 +264,7 @@ def run_preflight(config: DynamicAlphaConfig = DynamicAlphaConfig()) -> Prefligh
         warnings.append(
             f"{len(audit.unsorted_vol_date_records)} records store expiries out of "
             "order; VolQuoteSet sorts aligned quote objects before calibration")
-    warnings.append("r/q/repo are not present in svi_data.pkl; the configured "
+    warnings.append("r/q/repo are not present in the SVI pickle; the configured "
                     "Task-7 values are assumptions and must be confirmed")
     warnings.append("the bundled calendar contains scheduled holidays only; append "
                     "exchange one-off closures before final research")
@@ -222,21 +272,31 @@ def run_preflight(config: DynamicAlphaConfig = DynamicAlphaConfig()) -> Prefligh
     try:
         strict = load_surface_history(
             config.data_path, config.market_conventions, beta_clamp=0.0,
-            observation_date_shift=config.observation_date_shift,
-            roll_observation_dates=config.roll_observation_dates)
+            duplicate_vol_date_policy=config.duplicate_vol_date_policy,
+            source_timezone=config.source_timezone,
+            market_timezone=config.market_timezone)
         prepared = load_surface_history(
             config.data_path, config.market_conventions,
             beta_clamp=config.beta_clamp,
-            observation_date_shift=config.observation_date_shift,
-            roll_observation_dates=config.roll_observation_dates)
+            duplicate_vol_date_policy=config.duplicate_vol_date_policy,
+            source_timezone=config.source_timezone,
+            market_timezone=config.market_timezone)
         coverage = _tenor_coverage(prepared, config.tenors)
         if len(prepared) != audit.n_records:
-            blockers.append(
-                f"configured SVI repair builds {len(prepared)}/{audit.n_records} "
-                "daily surfaces; inspect prepared_history.skipped")
-        if len(strict) != audit.n_records:
+            message = (
+                f"configured surface policy builds {len(prepared)}/"
+                f"{audit.n_records} daily surfaces and skips "
+                f"{audit.n_records - len(prepared)}; inspect "
+                "prepared_history.skipped")
+            if config.allow_skipped_surfaces:
+                warnings.append(message)
+            else:
+                blockers.append(message)
+        convexity_failures = (int(strict.skipped["reason"].str.contains(
+            "SVI-JW beta", regex=False).sum()) if not strict.skipped.empty else 0)
+        if convexity_failures:
             warnings.append(
-                f"{audit.n_records - len(strict)} day(s) violate the exact SVI-JW "
+                f"{convexity_failures} day(s) violate the exact SVI-JW "
                 f"convexity transform; configured beta_clamp={config.beta_clamp:g} "
                 "makes this repair explicit")
         if int(coverage["n_extrapolated"].sum()) > 0:
@@ -253,17 +313,13 @@ def cli() -> None:
     parser = argparse.ArgumentParser(
         description="Audit readiness for dynamic-alpha research Step 1")
     parser.add_argument("data", nargs="?", type=Path, default=DEFAULT_DATA_PATH)
-    parser.add_argument("--observation-date-shift", type=int, default=0)
-    parser.add_argument("--roll-observation-dates", action="store_true")
-    parser.add_argument("--allow-non-business-observation-dates",
-                        action="store_true")
+    parser.add_argument("--source-timezone", default="Asia/Shanghai")
+    parser.add_argument("--market-timezone", default="America/New_York")
     args = parser.parse_args()
     config = DynamicAlphaConfig(
         data_path=args.data,
-        observation_date_shift=args.observation_date_shift,
-        roll_observation_dates=args.roll_observation_dates,
-        require_business_observation_dates=(
-            not args.allow_non_business_observation_dates),
+        source_timezone=args.source_timezone,
+        market_timezone=args.market_timezone,
     )
     report = run_preflight(config)
     print(report.format())

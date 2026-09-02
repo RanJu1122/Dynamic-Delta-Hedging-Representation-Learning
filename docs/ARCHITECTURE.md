@@ -32,9 +32,9 @@ Task fixtures, CLIs, plots and output paths do not belong in the core.
 has `run()` and `validate()` and can be invoked independently through the CLI.
 `pipeline.py` only orchestrates those modules and writes artefacts.
 
-`dynamic_alpha_hedging` currently contains only code that genuinely exists:
-configuration, data loading, manifests and preflight.  Dynamic Steps 1-8 will be
-added one at a time; empty placeholder modules are deliberately avoided.
+`dynamic_alpha_hedging` contains configuration, data loading, manifests,
+preflight and one canonical module for each implemented Step 1-3.  Later steps
+will be added one at a time; empty placeholder modules are deliberately avoided.
 
 The planned dynamic dependency graph is not purely linear:
 
@@ -43,17 +43,22 @@ preflight -> Step 1 -> Step 2 -> Step 4 -> Step 5 -> Step 6 --\
                   \-> Step 3 -------------------------------> Step 7 -> Step 8
 ```
 
-Step 3 builds `beta(alpha)` by MC repricing and implied-vol inversion.  Step 7
-uses that map together with factor shapes and forecasts to produce hedge deltas.
+Step 1 decomposes rolling-grid IV changes into smile traversal and surface
+motion without future data.  Step 2 estimates both diagnostic raw-grid beta and
+the primary surface beta.  Step 3 builds `beta(alpha)` under that same primary
+definition by fixed-strike MC repricing and implied-vol inversion.  Its raw
+curve remains auditable; the inverse converter uses a monotone fit anchored at
+`alpha=1 -> beta=0` and excludes statistically unidentified far-wing cells.
+Step 7 uses the map with factor shapes and forecasts for hedge delta.
 
 ## Outputs
 
 ```text
 output/
 ├── pricing_calibration/
-└── dynamic_alpha_hedging/
+└── dynamic_alpha/
     └── stepNN/
 ```
 
-Future dynamic stages use `manifest.json` to record data/config/upstream hashes,
-random seeds, model policy and validation status.
+Dynamic stages use `manifest.json` to record data/config/upstream hashes, model
+policy and validation status.

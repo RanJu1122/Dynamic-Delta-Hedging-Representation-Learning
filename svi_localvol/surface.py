@@ -248,6 +248,31 @@ class VolSurface:
         vol = np.sqrt(w / res["tau"])
         return float(vol) if np.isscalar(K) or np.ndim(K) == 0 else vol
 
+    def implied_vol_log_strike_slope(self, T, K,
+                                     spot: float | None = None):
+        """Return ``d sigma_imp / d log(K)`` on the calibrated surface.
+
+        Since ``y = log(K / F)``, ``d y / d log(K) = 1`` at fixed forward.
+        With ``sigma_imp = sqrt(w / tau)``, the analytic slope is
+
+            d sigma_imp / d log(K) = (d w / d y) / (2 * tau * sigma_imp).
+
+        This is used by the dynamic-alpha study to diagnose the mechanical
+        smile traversal created by a daily ``K = level * spot`` grid.
+        """
+        res = self.total_variance(T, K, spot=spot, order=1)
+        w = np.maximum(np.asarray(res["w"], dtype=float), 0.0)
+        tau = float(res["tau"])
+        vol = np.sqrt(w / tau)
+        numerator = np.asarray(res["dw_dy"], dtype=float)
+        slope = np.divide(
+            numerator,
+            2.0 * tau * vol,
+            out=np.full_like(numerator, np.nan, dtype=float),
+            where=vol > 0.0,
+        )
+        return float(slope) if np.isscalar(K) or np.ndim(K) == 0 else slope
+
     def implied_total_variance(self, T, K):
         return self.total_variance(T, K, order=0)["w"]
 

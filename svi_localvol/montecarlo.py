@@ -40,7 +40,8 @@ from typing import Callable, Sequence
 import numpy as np
 import pandas as pd
 
-from .blackscholes import bs_delta_w, bs_price_w
+from .blackscholes import (bs_delta_w, bs_price_w, bs_vega,
+                           implied_total_variance)
 from .conventions import to_date
 from .params import validate_stickiness_alpha
 from .surface import VolSurface
@@ -547,6 +548,208 @@ class LocalVolMC:
                     mean_iv / mean_implied_w if mean_implied_w > 0 else np.nan),
             })
         return pricing, pd.DataFrame(bin_rows)
+
+    def bumped_implied_vol_diagnostics(
+            self, strikes: Sequence[float], maturity,
+            grid_up: LocalVolGrid, grid_down: LocalVolGrid,
+            bump: float) -> pd.DataFrame:
+        """Reprice fixed strikes after a spot bump and invert back to IV.
+
+        This is the dynamic-alpha study's model-beta primitive.  The up/down
+        local-vol grids must be rebuilt with their respective ``spot_adj`` and
+        the alpha being tested.  Each strike remains fixed while spot moves.
+        Both call and put estimators are evaluated.  The one with a valid price
+        inversion and the smaller beta standard error is retained.  This
+        adaptive parity choice avoids both a zero-event OTM estimator and an
+        intrinsic-value-dominated ITM estimator in the document's remote wings.
+
+        One common normal draw drives both spot bumps.  A constant-vol GBM
+        supplies a paired control variate; one coefficient fitted to the
+        up-minus-down price difference is applied to both legs, preserving the
+        controlled difference used to infer ``dIV``.
+        """
+        self._check_horizon(maturity)
+        strikes = np.asarray(strikes, dtype=float)
+        if strikes.ndim != 1 or strikes.size == 0:
+            raise ValueError("strikes must be a non-empty one-dimensional array")
+
+        s0 = float(self.surface.market.spot)
+        bump = float(bump)
+        if not 0.0 < bump < s0:
+            raise ValueError("bump must be strictly between zero and spot")
+        s_up, s_down = s0 + bump, s0 - bump
+        for name, shifted in (("up", grid_up), ("down", grid_down)):
+            if shifted.dates != self.grid.dates:
+                raise ValueError(f"{name} grid date axis differs from the base grid")
+            if not np.array_equal(shifted.ratios, self.grid.ratios):
+                raise ValueError(f"{name} grid ratio axis differs from the base grid")
+
+        mc_up = LocalVolMC(
+            self.surface, grid_up, n_paths=self.n_paths, seed=self.seed,
+            antithetic=self.antithetic, n_substeps=self.n_substeps)
+        mc_down = LocalVolMC(
+            self.surface, grid_down, n_paths=self.n_paths, seed=self.seed,
+            antithetic=self.antithetic, n_substeps=self.n_substeps)
+        z = self._draw()
+        terminal_lv_up = mc_up.terminal_spots(s_up, z)
+        terminal_lv_down = mc_down.terminal_spots(s_down, z)
+
+        df = self.surface.discount_factor(maturity)
+        tau_v = self.surface.tau_vol(maturity)
+        tau_r = self.surface.tau_r(maturity)
+        carry = float(np.exp(self.b * tau_r))
+        f0, f_up, f_down = s0 * carry, s_up * carry, s_down * carry
+        dlog_spot = float(np.log(s_up / s_down))
+        hv = np.repeat(self.dt_v / self.n_substeps, self.n_substeps)
+        brownian = (np.sqrt(hv)[:, None] * z).sum(axis=0)
+
+        rows: list[dict] = []
+        for strike in strikes:
+            sigma_base = float(self.surface.implied_vol(maturity, strike))
+            w_base = sigma_base ** 2 * tau_v
+            common_exp = np.exp(
+                self.b * tau_r - 0.5 * w_base + sigma_base * brownian)
+            terminal_cv_up = s_up * common_exp
+            terminal_cv_down = s_down * common_exp
+
+            def _measure_option(is_call: bool) -> dict:
+                option_type = "call" if is_call else "put"
+                if is_call:
+                    payoff_lv_up = df * np.maximum(
+                        terminal_lv_up - strike, 0.0)
+                    payoff_lv_down = df * np.maximum(
+                        terminal_lv_down - strike, 0.0)
+                    payoff_cv_up = df * np.maximum(
+                        terminal_cv_up - strike, 0.0)
+                    payoff_cv_down = df * np.maximum(
+                        terminal_cv_down - strike, 0.0)
+                else:
+                    payoff_lv_up = df * np.maximum(
+                        strike - terminal_lv_up, 0.0)
+                    payoff_lv_down = df * np.maximum(
+                        strike - terminal_lv_down, 0.0)
+                    payoff_cv_up = df * np.maximum(
+                        strike - terminal_cv_up, 0.0)
+                    payoff_cv_down = df * np.maximum(
+                        strike - terminal_cv_down, 0.0)
+
+                exact_cv_up = float(bs_price_w(
+                    f_up, strike, w_base, df, is_call=is_call))
+                exact_cv_down = float(bs_price_w(
+                    f_down, strike, w_base, df, is_call=is_call))
+                lv_diff_obs = _estimator_samples(
+                    payoff_lv_up - payoff_lv_down, self.antithetic)
+                cv_diff_obs = _estimator_samples(
+                    payoff_cv_up - payoff_cv_down, self.antithetic)
+                cv_var = float(cv_diff_obs.var(ddof=1))
+                control_beta = (
+                    float(np.cov(lv_diff_obs, cv_diff_obs, ddof=1)[0, 1]
+                          / cv_var) if cv_var > 0.0 else 0.0)
+                control_corr = (
+                    float(np.corrcoef(lv_diff_obs, cv_diff_obs)[0, 1])
+                    if cv_var > 0.0 and lv_diff_obs.std(ddof=1) > 0.0
+                    else np.nan)
+                adjusted_up = payoff_lv_up - control_beta * (
+                    payoff_cv_up - exact_cv_up)
+                adjusted_down = payoff_lv_down - control_beta * (
+                    payoff_cv_down - exact_cv_down)
+                pv_up_raw, pv_up_raw_stderr = _mean_stderr(
+                    payoff_lv_up, self.antithetic)
+                pv_down_raw, pv_down_raw_stderr = _mean_stderr(
+                    payoff_lv_down, self.antithetic)
+                pv_up, pv_up_stderr = _mean_stderr(
+                    adjusted_up, self.antithetic)
+                pv_down, pv_down_stderr = _mean_stderr(
+                    adjusted_down, self.antithetic)
+
+                if is_call:
+                    lower_up = df * max(f_up - strike, 0.0)
+                    lower_down = df * max(f_down - strike, 0.0)
+                    upper_up, upper_down = df * f_up, df * f_down
+                else:
+                    lower_up = df * max(strike - f_up, 0.0)
+                    lower_down = df * max(strike - f_down, 0.0)
+                    upper_up = upper_down = df * strike
+                epsilon = 1e-12 * max(1.0, s0)
+                pv_up_inversion = float(np.clip(
+                    pv_up, lower_up + epsilon, upper_up - epsilon))
+                pv_down_inversion = float(np.clip(
+                    pv_down, lower_down + epsilon, upper_down - epsilon))
+                price_clipped = bool(
+                    pv_up_inversion != pv_up
+                    or pv_down_inversion != pv_down)
+                w_up = float(implied_total_variance(
+                    pv_up_inversion, f_up, strike, df, is_call=is_call))
+                w_down = float(implied_total_variance(
+                    pv_down_inversion, f_down, strike, df, is_call=is_call))
+                iv_up = float(np.sqrt(w_up / tau_v))
+                iv_down = float(np.sqrt(w_down / tau_v))
+                div = iv_up - iv_down
+                model_beta = -div / dlog_spot
+                vega_up = float(bs_vega(
+                    f_up, strike, w_up, df, tau_v))
+                vega_down = float(bs_vega(
+                    f_down, strike, w_down, df, tau_v))
+                if vega_up > 0.0 and vega_down > 0.0:
+                    linearized_iv_difference = (
+                        adjusted_up / vega_up - adjusted_down / vega_down)
+                    _, div_stderr = _mean_stderr(
+                        linearized_iv_difference, self.antithetic)
+                    beta_stderr = div_stderr / abs(dlog_spot)
+                else:
+                    div_stderr = np.nan
+                    beta_stderr = np.nan
+                return {
+                    "strike": float(strike),
+                    "level": float(strike / s0),
+                    "option_type": option_type,
+                    "base_implied_vol": sigma_base,
+                    "spot_up": s_up,
+                    "spot_down": s_down,
+                    "dlogS_bump": dlog_spot,
+                    "forward_up": f_up,
+                    "forward_down": f_down,
+                    "pv_up_raw": pv_up_raw,
+                    "pv_down_raw": pv_down_raw,
+                    "pv_up_raw_stderr": pv_up_raw_stderr,
+                    "pv_down_raw_stderr": pv_down_raw_stderr,
+                    "price_control_beta": control_beta,
+                    "price_control_corr": control_corr,
+                    "pv_up": pv_up,
+                    "pv_down": pv_down,
+                    "pv_up_stderr": pv_up_stderr,
+                    "pv_down_stderr": pv_down_stderr,
+                    "price_clipped_for_inversion": price_clipped,
+                    "implied_vol_up": iv_up,
+                    "implied_vol_down": iv_down,
+                    "dIV_model": div,
+                    "dIV_model_stderr": div_stderr,
+                    "beta_model": model_beta,
+                    "beta_model_stderr": beta_stderr,
+                }
+
+            candidates = [_measure_option(True), _measure_option(False)]
+            candidates.sort(key=lambda row: (
+                bool(row["price_clipped_for_inversion"]),
+                not np.isfinite(row["beta_model_stderr"]),
+                float(row["beta_model_stderr"])))
+            chosen, alternate = candidates
+            chosen.update({
+                "option_selection": "valid inversion then minimum beta stderr",
+                "alternate_option_type": alternate["option_type"],
+                "alternate_price_clipped_for_inversion": alternate[
+                    "price_clipped_for_inversion"],
+                "alternate_beta_model_stderr": alternate[
+                    "beta_model_stderr"],
+                "n_paths": int(terminal_lv_up.size),
+                "n_steps": int(len(self.dt_r) * self.n_substeps),
+                "grid_up_n_undefined": int(grid_up.n_undefined),
+                "grid_down_n_undefined": int(grid_down.n_undefined),
+                "grid_up_n_clipped": int(grid_up.n_clipped),
+                "grid_down_n_clipped": int(grid_down.n_clipped),
+            })
+            rows.append(chosen)
+        return pd.DataFrame(rows)
 
     def bump_delta_diagnostics(self, strikes: Sequence[float], maturity,
                                grid_up: LocalVolGrid,

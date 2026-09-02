@@ -447,12 +447,12 @@ $$
 
 ### 9.2 `beta_converter`
 
-代码先对 Beta–Alpha 曲线做非增单调化，再减去 Alpha=1 处的数值偏差：
+代码只减去 Alpha=1 处的数值偏差：
 
 $$
 \beta_{\rm converter}(\alpha)
-=\beta_{\rm monotone}(\alpha)
--\beta_{\rm monotone}(1).
+=\beta_{\rm model}(\alpha)
+-\beta_{\rm model}(1).
 $$
 
 因此：
@@ -461,9 +461,11 @@ $$
 \beta_{\rm converter}(1)=0.
 $$
 
-这是正式固定-strike反查 Alpha 使用的曲线。
+这个常数平移不会改变原始 MC 曲线的形状。正式版不再做单调投影：全部曲线都
+会保存，误差、跨度、价格反解和 local-vol 网格检查只写入质量审计。只有原始
+曲线非单调时，因为不存在唯一反函数，该格点不写入 fixed-strike inverse。
 
-### 9.3 `beta_converter_normalized`
+### 9.3 normalized 口径
 
 $$
 \beta_{\rm converter,normalized}(\alpha)
@@ -471,12 +473,13 @@ $$
 -\frac{\partial IV}{\partial\log K}.
 $$
 
-它用于和历史 `beta_grid_raw` 对照。
+它可以用于和历史 `beta_grid_raw` 做专项诊断，但不是正式 inverse 的输入，正式
+Step 3 因此不再单独保存 normalized 输出文件。
 
 完整结果保存在：
 
 - `output/dynamic_alpha/step03/beta_alpha_curve.csv`；
-- `output/dynamic_alpha/step03/beta_alpha_normalized_diagnostic.csv`；
+- `output/dynamic_alpha/step03/cell_quality.csv`；
 - `output/dynamic_alpha/step03/alpha_beta_inverse.csv`。
 
 ## 10. 历史 Beta 如何映射成 Alpha
