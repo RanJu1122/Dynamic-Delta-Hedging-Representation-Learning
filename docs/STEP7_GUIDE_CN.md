@@ -1,5 +1,9 @@
 # Step 7：动态 Alpha 回测框架
 
+新增的解析 delta 对照、训练期多日期转换器、MC 一致性检查和已完成的缓存复算，
+见 [Delta 与转换器对照](STEP7_DELTA_COMPARISON_CN.md)。下文开头的“未运行”描述为框架初版状态，
+不代表目前没有回测输出。
+
 本版完成可运行框架、真实输入准备检查和小样本测试，**未运行全历史正式 MC 回测，也尚无对冲改善结论**。原始依据为《动态Alpha对冲研究》Step 7.1–7.4；此前审查见 [实施方案](STEP7_AUDIT_AND_PLAN_CN.md)。
 
 ## 1. 一套引擎，三种组合
@@ -69,10 +73,10 @@ Beta–Alpha 曲线越平，逆解越敏感；MC 噪声、粗网格、bump 大�
 
 ## 4. 对照组、平滑与组合账本
 
-包含固定 Alpha=0/0.5/1/1.5/2、`best_fixed_train`、`bs_delta`、`rolling_beta`、`rolling_alpha_mean`、`dynamic_raw` 和 `dynamic_ema`。
+包含固定 Alpha=0/0.5/1/1.5/2、`best_fixed_train`、`bs_delta`、`last_observed_factor`、`rolling_alpha_mean`、`dynamic_raw` 和 `dynamic_ema`。
 
 - 最好固定档：按训练期相同 book 的含 carry、未扣交易成本误差标准差选取，测试期冻结。不用测试期挑“最好档”。
-- `rolling_beta`：截至 t 已知的 Step 2 滚动回归 Beta 反查；与下一日 Daily Beta 预测不同。
+- `last_observed_factor`：用 close-t 最近已知 daily 因子预测下一日，和动态策略共用因子数、载荷、转换器及当日 Delta 表。当天因子缺失时的回退规则见 [daily-only 说明](DAILY_ONLY_PIPELINE_CN.md)。
 - `rolling_alpha_mean`：过去 20 个有效已实现 Daily Beta 在各自当时曲面反查的 Alpha 均值，不把同一个旧观测重复算多次；无历史时为 1。
 - EMA：$\alpha_t^{EMA}=\lambda\alpha_{t-1}^{EMA}+(1-\lambda)\alpha_t^{raw}$，$\lambda=2^{-1/H}$；默认 H=10 个交易日，初值为训练最好固定档。H=0 表示不平滑。5/20 日仅作预设敏感性，不能拿测试集选最优 H。
 
@@ -148,3 +152,9 @@ python -m dynamic_alpha_hedging step7 --book full --factors 2 --output output/dy
 仅 `--prepare` 时输出 `preparation.json`、预测 CSV 和模型，不产生正式回测 manifest。训练 MC 节点可在缓存中审计。首版以 CSV 为主，不额外生成重复图表。
 
 实现分工：[step06.py](../dynamic_alpha_hedging/step06.py) 提供共享预测器；[hedging.py](../dynamic_alpha_hedging/hedging.py) 负责固定合约估值、联合 MC 表及 inverse；[step07.py](../dynamic_alpha_hedging/step07.py) 负责策略、现金账和统计；[montecarlo.py](../svi_localvol/montecarlo.py) 仍是共用定价核心。旧 Step 1–6 输出未覆盖。
+
+## 2026-09-08 接口更新
+
+独立预计算、只读 MC 库、模型选择、三个快照排除和分段回测的完整参数与命令见 [MC_PRECOMPUTE_CN.md](MC_PRECOMPUTE_CN.md)。历史结果文件尚未按新排除口径重跑。
+
+当前输入特征数为 13，回归 rolling Beta 已完全移除。摘要同时比较最好固定 Alpha 与 `last_observed_factor` 对冲误差；历史报告仍是旧版本结果。

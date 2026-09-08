@@ -1,5 +1,7 @@
 # Step 7 near-ATM book：实验设置、模型与结果分析
 
+> 历史版本记录：本文的模型特征、rolling Beta 对照及数值属于当时实验。当前代码已改为 [daily-only 流程](DAILY_ONLY_PIPELINE_CN.md)，未据新代码重算本文结果。
+
 本文对应已完成的 `output/dynamic_alpha/step07_near_atm_fast/` 实验，依据该目录的 manifest、CSV 和实际代码核对，不将其他 book 或其他转换器的结果混入本次结论。
 
 核心结论：在六份 near-ATM call 构成的模拟 book 上，未平滑动态策略相对训练期最优固定 alpha 的对冲误差标准差降低 **2.16%**，解析 shadow delta 得到近似结果。改善主要集中在 6M、1Y，但统计区间跨零、换手增加，且 MC 网格质量与部分原始 spot 数据仍需验证。因此这是正向研究迹象，而不是已经确认的稳定对冲优势。

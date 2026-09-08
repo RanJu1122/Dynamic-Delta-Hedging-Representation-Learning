@@ -1,5 +1,7 @@
 # Step 6–7 代码、模型、回测与归因详解
 
+> 历史版本记录：本文的模型特征、rolling Beta 对照及数值属于当时实验。当前代码已改为 [daily-only 流程](DAILY_ONLY_PIPELINE_CN.md)，未据新代码重算本文结果。
+
 本文依据当前代码、各步骤 manifest、Step 6 输出，以及 2026-09-07 完成的 Step 7 运行结果编写。分析对象是以下命令产生的结果：
 
 ```bash

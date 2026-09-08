@@ -43,8 +43,9 @@ has the required sticky-strike target `alpha=1 -> beta_surface ~= 0`.
 `step01.py` is the only Step 1 implementation and writes rolling-grid changes.
 It also exports the otherwise opaque pickle to `raw_svi_quotes.csv`, preserving
 the original key text and flagging whether a source timestamp was available.
-`step02.py` is the only Step 2 implementation and writes daily-ratio and trailing
-OLS raw-grid and surface beta, including regression diagnostics.  Step 2 reads
+`step02.py` is the only Step 2 implementation and writes daily-ratio raw-grid
+and surface beta with threshold and regime diagnostics. Regression-beta
+calculations and inputs have been removed under `daily_only_v1`.  Step 2 reads
 the saved Step 1 artefact instead of silently rerunning it.  `step03.py` fixes a
 representative SVI surface, reprices fixed strikes under bumped spot for each
 Alpha, inverts prices to IV and writes both `beta(alpha)` and the usable inverse
@@ -57,7 +58,7 @@ file satisfies that date contract.  Its explicit tolerance policy keeps the firs
 row of a repeated VolDate and records every dropped duplicate in the raw export;
 the small number of still-unbuildable observations are listed and excluded.
 Multi-business-day gaps remain visible in Step 1 but are excluded from the
-default daily/rolling beta regressions.
+daily-beta labels and holding intervals.
 
 Run:
 
@@ -67,3 +68,6 @@ python3 -m dynamic_alpha_hedging step1
 python3 -m dynamic_alpha_hedging step2
 python3 -m dynamic_alpha_hedging step3 --fast
 ```
+
+The active Step 5/6 forecast benchmark is the last known daily Beta/factor, with
+no cross-gap forward fill. See [daily-only requirements](DAILY_ONLY_PIPELINE_CN.md).

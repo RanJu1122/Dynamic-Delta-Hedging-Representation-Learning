@@ -1,5 +1,7 @@
 # 动态 Alpha 研究：Step 4–6 模型与结果总结
 
+> 历史版本记录：本文的模型特征、rolling Beta 对照及数值属于当时实验。当前代码已改为 [daily-only 流程](DAILY_ONLY_PIPELINE_CN.md)，未据新代码重算本文结果。
+
 ## 研究链条
 
 Step 2 已得到每日 Beta 曲面：

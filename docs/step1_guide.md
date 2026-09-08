@@ -53,49 +53,28 @@ Step 1 输出：
 - `tenor_coverage.csv`：期限覆盖情况；
 - `manifest.json`：配置、输入哈希和验证结果。
 
-## Step 2：两个 beta，只有一个主标签
+## Step 2：两个日比值，只有一个主标签
 
-诊断用原始格点 beta：
+诊断用 `beta_grid_raw_daily = -dIV_grid / dlogS`；正式研究使用
+`beta_surface_daily = -dIV_surface / dlogS`，其中已扣除前一曲面的 smile crossing。
+默认只在 `abs(dlogS)>=0.0025`、分母非零且相邻业务日时生成日度标签。
+跨缺口的 Step 1 变化保留为审计记录，不当作日度标签。
 
-```text
-beta_grid_raw = -dIV_grid / dlogS
-```
+当前流程不再计算或输出 rolling regression Beta。输出包括：
 
-Step 3–7 使用的正式 beta：
-
-```text
-beta_surface = -dIV_surface / dlogS
-dIV_surface = intercept - beta_surface_rolling * dlogS + residual
-```
-
-`beta_daily.csv` 保存两个日比值；只有 `|dlogS| >= 0.005` 时计算。
-`beta_rolling.csv` 保存两个 trailing OLS 结果及 intercept、R²、slope standard
-error、nobs。`beta_surface` 是正式研究口径，其 Step 3 sanity check 是
-`alpha=1 -> beta_surface ~= 0`。
-
-Step 1 保留并标记相邻有效曲面之间跨越多个交易日的转移；Step 2 的默认日频
-估计只使用 `is_next_business_observation=True` 的转移，避免把2至5日累计变化
-混入一日 beta。Rolling window 表示最近60个有效曲面变化观测，不是强制60个
-日历日；只有当前格点本身有效时才输出 beta。这个约定允许1M使用其真实覆盖
-样本，同时绝不对原始期限范围以外的1M曲面做静默外推。
-
-Step 2 还保存文档要求的完整诊断：
-
-- `beta_threshold_sensitivity.csv`：`|dlogS|` 阈值0.25%/0.5%/1%；
-- `beta_rolling_sensitivity.csv`：20/40/60/120窗口和等权、`|dlogS|`加权、
-  20日半衰期时间衰减的完整时序；
-- `beta_rolling_sensitivity_summary.csv`：上述平滑选择的汇总比较；
-- `beta_reasonableness.csv`：范围、分位数、正beta比例；
-- `beta_regime_checks.csv`：上涨/下跌、高ATM IV/低ATM IV条件回归；
-- `beta_term_structure.csv`：ATM beta短端到长端的期限结构。
-
-这些检查以 `beta_surface` 为主；`beta_grid_raw` 仍完整保存在标准daily和rolling
-文件中，供后续步骤统一做坐标口径敏感性。
+- `beta_daily.csv`：两套日比值及可用性标记；
+- `summary.csv`：单元统计；
+- `beta_threshold_sensitivity.csv`：0.1%/0.25%/0.5%/1% 门槛敏感性；
+- `beta_reasonableness.csv`：daily Beta 分布；
+- `beta_regime_checks.csv`：涨跌、高低波状态下的 daily 比值统计；
+- `beta_term_structure.csv`：ATM daily Beta 期限统计。
 
 ```bash
-python -m dynamic_alpha_hedging step2 --window 60 --min-obs 20 \
-  --min-abs-dlogS 0.005
+python -m dynamic_alpha_hedging step2 --min-abs-dlogS 0.0025
 ```
+
+`--window`、`--min-obs` 和 Step 5/6 的 `--rolling-beta` 参数已删除。
+完整模型/基准规则见 [DAILY_ONLY_PIPELINE_CN.md](DAILY_ONLY_PIPELINE_CN.md)。
 
 ## 日期和输入约定
 

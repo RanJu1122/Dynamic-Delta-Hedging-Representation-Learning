@@ -235,88 +235,18 @@ $$
 
 这就是历史结果中 Grid Beta 往往明显更大的原因。
 
-## 5. Daily Beta 和 Rolling Beta
+## 5. 当前使用 Daily Beta
 
-Daily 与 Rolling 不是两套不同的经济定义，而是同一个 Beta 的两种估计方法。
-
-当前输出看似有四个 Beta：
-
-- `beta_grid_raw_daily`；
-- `beta_surface_daily`；
-- `beta_grid_raw_rolling`；
-- `beta_surface_rolling`。
-
-实际结构是：
+当前输出只有 `beta_grid_raw_daily` 与 `beta_surface_daily` 两种 dIV 口径的日比值：
 
 $$
-2\text{种 dIV 口径}\times2\text{种估计方法}.
+\beta_{{\rm grid},t}=-dIV_{{\rm grid},t}/d\log S_t,\qquad
+\beta_{{\rm surface},t}=-dIV_{{\rm surface},t}/d\log S_t.
 $$
 
-### 5.1 Daily ratio
+默认 `abs(dlogS)<0.0025`、零收益或跨缺口时不生成有效标签。Daily 比值仍有小分母与噪声问题，删除 rolling Beta 不表示这些问题消失。
 
-逐日直接相除：
-
-$$
-\beta_{{\rm grid},t}^{\rm daily}
-=-\frac{dIV_{{\rm grid},t}}{d\log S_t},
-$$
-
-$$
-\beta_{{\rm surface},t}^{\rm daily}
-=-\frac{dIV_{{\rm surface},t}}{d\log S_t}.
-$$
-
-当
-
-$$
-|d\log S|<0.005
-$$
-
-即 Spot 变化不足 0.5% 时，当前代码不计算 Daily Beta，避免分母过小导致比值爆炸。
-
-Daily Beta 反应快，但噪声较大，而且不能有效分离每日 IV 漂移。
-
-### 5.2 Rolling OLS Beta
-
-对每一个固定 $(\tau,m)$，使用最近60个有效变化观测回归：
-
-$$
-dIV_i=c+b\,d\log S_i+\varepsilon_i.
-$$
-
-定义：
-
-$$
-\boxed{\beta=-b}.
-$$
-
-所以也可以写成：
-
-$$
-dIV_i=c-\beta d\log S_i+\varepsilon_i.
-$$
-
-其中：
-
-- $c$：截距，吸收与 Spot 无关的平均 IV 漂移；
-- $\beta$：Spot 对 IV 的经验影响；
-- $R^2$：Spot 变化解释 IV 变化的比例；
-- `slope_stderr`：斜率估计误差；
-- `nobs`：窗口内有效样本数。
-
-Rolling 默认设置为：
-
-- 最近60个有效观测，不是60个日历日；
-- 至少20个样本才输出；
-- 只使用相邻有效交易日；
-- 基准 OLS 不剔除小幅 Spot 日，0.5%阈值主要用于 Daily ratio。
-
-通常正式研究更适合使用 Rolling OLS，因为回归可以避免单日小分母严重放大，通过截距吸收平均漂移，并输出 $R^2$ 和标准误。
-
-结果分别保存在：
-
-- `output/dynamic_alpha/step02/beta_daily.csv`；
-- `output/dynamic_alpha/step02/beta_rolling.csv`。
+原始研究文档建议过回归弹性；用户结合先前实验明确选择 daily-only。2026-09-08 的当前实现已经移除 rolling 回归估计、相关特征、文件输入和比较策略。Step 5/6 改为与最近已知 daily Beta/因子比较，细节见 [DAILY_ONLY_PIPELINE_CN.md](DAILY_ONLY_PIPELINE_CN.md)。
 
 ## 6. Alpha 的含义
 
