@@ -661,6 +661,9 @@ class LocalVolMC:
                     adjusted_up, self.antithetic)
                 pv_down, pv_down_stderr = _mean_stderr(
                     adjusted_down, self.antithetic)
+                delta, delta_stderr = _mean_stderr(
+                    (adjusted_up - adjusted_down) / (2.0 * bump),
+                    self.antithetic)
 
                 if is_call:
                     lower_up = df * max(f_up - strike, 0.0)
@@ -719,6 +722,10 @@ class LocalVolMC:
                     "pv_down": pv_down,
                     "pv_up_stderr": pv_up_stderr,
                     "pv_down_stderr": pv_down_stderr,
+                    # Always expose a CALL delta, including when the more
+                    # stable IV inversion was the put.  Parity is exact.
+                    "call_delta": delta + (0.0 if is_call else df * carry),
+                    "call_delta_stderr": delta_stderr,
                     "price_clipped_for_inversion": price_clipped,
                     "implied_vol_up": iv_up,
                     "implied_vol_down": iv_down,

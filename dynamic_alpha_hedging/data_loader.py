@@ -67,6 +67,14 @@ REQUIRED_QUOTE_FIELDS: tuple[str, ...] = (
     "StickinessRatio",
 )
 
+# Keep unchanged-Spot snapshots: IV changes and cash P&L remain observable.
+# Realised ratio Beta is undefined on zero-return days (audited in Step 2).
+EXCLUDED_OBSERVATIONS: dict[dt.date, str] = {}
+
+
+def observation_exclusions() -> list[str]:
+    return [d.isoformat() for d in sorted(EXCLUDED_OBSERVATIONS)]
+
 
 def deduplicate_vol_dates(record: dict, policy: str = "first") -> dict:
     """Return a quote record with at most one row per VolDate.
@@ -242,6 +250,7 @@ def raw_quote_frame(path: str | Path, *,
                 "slice_index": slice_index,
                 "vol_date_occurrence": occurrence,
                 "kept_by_first_duplicate_policy": occurrence == 0,
+                "observation_exclusion_reason": EXCLUDED_OBSERVATIONS.get(market_date, ""),
             }
             for field in quote_fields:
                 value = record[field][slice_index]
@@ -333,6 +342,10 @@ def load_surface_history(path: str | Path,
     for d in wanted:
         rec = records[d]
         spots[d] = float(rec["Spot"])
+        if d in EXCLUDED_OBSERVATIONS:
+            failures.append({"date": d, "n_slices": len(rec["VolDate"]),
+                             "reason": EXCLUDED_OBSERVATIONS[d]})
+            continue
         try:
             surfaces[d] = build_surface(d, rec, conventions, calendar_repair,
                                         beta_clamp=beta_clamp,

@@ -29,7 +29,9 @@ def write_manifest(path: str | Path, *, stage: str, config: Any,
         "inputs": inputs,
         "validation": validation,
     }
-    target.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    temporary.replace(target)
     return target
 
 

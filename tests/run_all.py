@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import importlib
+import inspect
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 MODULES = (
     "tests.test_core",
     "tests.test_pricing_calibration",
     "tests.test_dynamic_alpha_hedging",
+    "tests.test_step07",
+    "tests.test_precompute",
+    "tests.test_exclusion_workflow",
+    "tests.test_daily_only",
+    "tests.test_shared_step07",
+    "tests.test_fixed_book",
+    "tests.test_mc_revision",
 )
 
 
@@ -21,7 +31,14 @@ def main() -> int:
     failed = 0
     for name, function in sorted(tests):
         try:
-            function()
+            parameters = inspect.signature(function).parameters
+            if parameters:
+                if set(parameters) != {"tmp_path"}:
+                    raise TypeError(f"unsupported test parameters: {list(parameters)}")
+                with TemporaryDirectory() as directory:
+                    function(tmp_path=Path(directory))
+            else:
+                function()
             print(f"PASS {name}")
         except Exception as exc:  # noqa: BLE001
             failed += 1

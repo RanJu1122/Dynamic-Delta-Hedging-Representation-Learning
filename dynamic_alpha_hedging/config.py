@@ -21,6 +21,8 @@ RESEARCH_TENORS: tuple[float, ...] = (
 # The document's literal grid is 0.4, 0.5, ..., 1.2.  Finer grids belong in
 # an explicit sensitivity run rather than silently changing the baseline.
 RESEARCH_STRIKE_LEVELS: tuple[float, ...] = tuple(x / 10 for x in range(4, 13))
+STEP4_TENORS: tuple[float, ...] = RESEARCH_TENORS[1:]
+STEP4_STRIKE_LEVELS: tuple[float, ...] = tuple(x / 10 for x in range(4, 12))
 
 
 @dataclass(frozen=True)
@@ -43,23 +45,23 @@ class DynamicAlphaConfig:
     expiry_axis: str = "constant_tau"
     tenors: tuple[float, ...] = RESEARCH_TENORS
     strike_levels: tuple[float, ...] = RESEARCH_STRIKE_LEVELS
+    step4_tenors: tuple[float, ...] | None = None
+    step4_strike_levels: tuple[float, ...] | None = None
+    step4_anchor_tenor: float | None = None
+    step4_anchor_level: float | None = None
+    step4_train_fraction: float = 0.75
     level_anchor: str = "spot"
     extrapolation: str = "nan"
-    beta_min_abs_dlogS: float = 0.005
+    beta_min_abs_dlogS: float = 0.0025
     beta_require_consecutive_business_days: bool = True
-    beta_window: int = 60
-    beta_min_obs: int = 20
-    beta_threshold_sensitivity: tuple[float, ...] = (0.0025, 0.005, 0.01)
-    beta_window_sensitivity: tuple[int, ...] = (20, 40, 60, 120)
-    beta_weight_sensitivity: tuple[str, ...] = (
-        "equal", "abs_dlogS", "time_decay")
-    beta_time_decay_half_life: float = 20.0
+    beta_threshold_sensitivity: tuple[float, ...] = (
+        0.001, 0.0025, 0.005, 0.01)
     step3_alphas: tuple[float, ...] = (0.0, 0.5, 1.0, 1.5, 2.0)
     step3_calibration_date: dt.date | None = None
     step3_spot_bump_fraction: float = 0.01
     # Production Step 3 defaults.  ``--fast`` in the CLI is deliberately a
     # diagnostic run and must not be used to publish the converter.
-    step3_n_paths: int = 100_000
+    step3_n_paths: int = 40_000
     step3_seed: int = 20260807
     step3_antithetic: bool = True
     step3_n_substeps: int = 2
@@ -91,24 +93,42 @@ class DynamicAlphaConfig:
             raise ValueError("tenors must be strictly positive")
         if not self.strike_levels or min(self.strike_levels) <= 0:
             raise ValueError("strike levels must be strictly positive")
+        if self.step4_tenors is None:
+            selected = tuple(x for x in self.tenors if x in STEP4_TENORS)
+            object.__setattr__(
+                self, "step4_tenors", selected if selected else self.tenors)
+        if self.step4_strike_levels is None:
+            selected = tuple(
+                x for x in self.strike_levels if x in STEP4_STRIKE_LEVELS)
+            object.__setattr__(
+                self, "step4_strike_levels",
+                selected if selected else self.strike_levels)
+        if self.step4_anchor_tenor is None:
+            object.__setattr__(
+                self, "step4_anchor_tenor",
+                min(self.step4_tenors, key=lambda x: abs(x - 0.25)))
+        if self.step4_anchor_level is None:
+            object.__setattr__(
+                self, "step4_anchor_level",
+                min(self.step4_strike_levels, key=lambda x: abs(x - 1.0)))
+        if not self.step4_tenors or not set(self.step4_tenors).issubset(
+                self.tenors):
+            raise ValueError("step4_tenors must be a non-empty tenor subset")
+        if not self.step4_strike_levels or not set(
+                self.step4_strike_levels).issubset(self.strike_levels):
+            raise ValueError(
+                "step4_strike_levels must be a non-empty strike-level subset")
+        if self.step4_anchor_tenor not in self.step4_tenors:
+            raise ValueError("step4_anchor_tenor must be retained in Step 4")
+        if self.step4_anchor_level not in self.step4_strike_levels:
+            raise ValueError("step4_anchor_level must be retained in Step 4")
+        if not 0.5 <= self.step4_train_fraction < 1.0:
+            raise ValueError("step4_train_fraction must lie in [0.5, 1.0)")
         if self.beta_min_abs_dlogS < 0:
             raise ValueError("beta_min_abs_dlogS must be non-negative")
-        if self.beta_window < 2:
-            raise ValueError("beta_window must be at least 2")
-        if not 2 <= self.beta_min_obs <= self.beta_window:
-            raise ValueError("beta_min_obs must be between 2 and beta_window")
         if (not self.beta_threshold_sensitivity
                 or min(self.beta_threshold_sensitivity) < 0):
             raise ValueError("beta threshold sensitivities must be non-negative")
-        if (not self.beta_window_sensitivity
-                or min(self.beta_window_sensitivity) < 2):
-            raise ValueError("beta window sensitivities must be at least 2")
-        allowed_weights = {"equal", "abs_dlogS", "time_decay"}
-        if not self.beta_weight_sensitivity or not set(
-                self.beta_weight_sensitivity).issubset(allowed_weights):
-            raise ValueError("unsupported beta weight sensitivity")
-        if self.beta_time_decay_half_life <= 0:
-            raise ValueError("beta_time_decay_half_life must be positive")
         if not self.step3_alphas:
             raise ValueError("step3_alphas must not be empty")
         validated_alphas = tuple(

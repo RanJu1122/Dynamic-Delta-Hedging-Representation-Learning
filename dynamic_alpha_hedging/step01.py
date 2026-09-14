@@ -20,7 +20,7 @@ from svi_localvol.conventions import nb_biz_days
 from .artifacts import file_sha256, write_manifest
 from .config import DynamicAlphaConfig
 from .data_loader import (ImpliedVolPanel, SurfaceHistory, implied_vol_panel,
-                          load_surface_history, raw_quote_frame)
+                          load_surface_history, raw_quote_frame, observation_exclusions)
 
 
 @dataclass
@@ -238,6 +238,7 @@ def run_step1(config: DynamicAlphaConfig = DynamicAlphaConfig(), *,
     result = Step1Result(
         config, state, changes, history.skipped.copy(), _summary(changes), {})
     result.validation = _validate(result)
+    result.validation["excluded_observation_dates"] = observation_exclusions()
     return result
 
 
