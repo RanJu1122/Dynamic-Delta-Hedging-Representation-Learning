@@ -163,7 +163,9 @@ def _term_structure(daily):
 
 def run_step2(changes, config=DynamicAlphaConfig()):
     """Daily-ratio estimator only; no regression-beta feature or benchmark."""
+    from .grid import validate_cells
     _validate_input(changes)
+    validate_cells(changes, config.tenors, config.strike_levels, source="Step 1 changes")
     daily = _daily_beta(changes, config.beta_min_abs_dlogS, config.beta_require_consecutive_business_days)
     validation = {
         "beta_workflow": "daily_only_v1",

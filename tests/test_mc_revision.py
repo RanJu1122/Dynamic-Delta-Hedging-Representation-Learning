@@ -46,7 +46,7 @@ def test_default_dispatch_only_three_strategies_and_40k_new_mc():
              patch("dynamic_alpha_hedging.step07.prepare_step7", return_value=inputs) as prepare, \
              patch("dynamic_alpha_hedging.step07_fixed_book.run_fixed_step7", return_value=result) as runner:
             cli()
-        assert len(prepare.call_args.args[0].step4_strike_levels) == 8
+        assert len(prepare.call_args.args[0].step4_strike_levels) == 9
         assert runner.call_args.kwargs["options"].strategy_set == "dynamic"
         assert not runner.call_args.kwargs["options"].include_controls
         assert runner.call_args.kwargs["mc_config"].step3_n_paths == 40000

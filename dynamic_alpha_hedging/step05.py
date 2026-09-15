@@ -23,6 +23,7 @@ from sklearn.preprocessing import StandardScaler
 
 from .artifacts import file_sha256, write_manifest
 from .config import DynamicAlphaConfig
+from .grid import validate_cells
 
 
 FACTOR_COLUMNS = ("atm_beta_factor", "shape_score_1", "shape_score_2")
@@ -616,6 +617,9 @@ def run_step5(factors: pd.DataFrame, loadings: pd.DataFrame,
               daily_beta: pd.DataFrame,
               config: DynamicAlphaConfig = DynamicAlphaConfig()) -> Step5Result:
     """Test whether close-t state predicts the next realised daily beta."""
+    validate_cells(loadings, config.step4_tenors, config.step4_strike_levels,
+                   source="Step 4 loadings")
+    validate_cells(daily_beta, config.tenors, config.strike_levels, source="Step 2 beta")
     panel = _build_factor_state_panel(factors, iv_state, changes)
     spot_regression, panel = _spot_regressions(panel)
     factor_acf = _factor_acf(panel)
@@ -623,6 +627,8 @@ def run_step5(factors: pd.DataFrame, loadings: pd.DataFrame,
     prediction_sample = _daily_prediction_sample(
         panel, daily_beta, config)
     predictions, prediction_splits = _fit_daily_beta_models(prediction_sample)
+    validate_cells(prediction_splits, config.step4_tenors, config.step4_strike_levels,
+                   source="Step 5 fitted models (each cell needs enough usable labels)")
     model_summary = _daily_prediction_summary(predictions)
     attribution = _attribution_baseline(factors, loadings, changes)
 

@@ -37,6 +37,7 @@ def engine_signature():
     return digest({
         "files": {name: file_sha256(root / name) for name in files},
         "measure": inspect.getsource(MCMapStore.measure),
+        "measure_many": inspect.getsource(MCMapStore.measure_many),
         "anchor": inspect.getsource(_anchor_at_sticky_strike),
         "expiry": inspect.getsource(date_at_tau),
     })
@@ -162,24 +163,39 @@ class MCLibrary:
         return pd.concat([self.read(surface, t) for t in self.tenors], ignore_index=True)
 
     def ensure(self, surface, tenor):
+        return next(self.ensure_many(surface, (tenor,)))[1]
+
+    def ensure_many(self, surface, tenors):
+        """Yield cached shards, then price missing tenors together for one date.
+
+        Shards remain independently checksummed and atomically resumable. No
+        cached tenor is simulated merely to include it in the shared batch.
+        """
         if not self.writable:
             raise RuntimeError("read-only MC library cannot precompute")
-        key, tenor = self._key(surface, tenor)
-        if key in self.index:
-            return self.read(surface, tenor)
-        expiry = date_at_tau(surface, tenor)
-        if not surface.taus[0] <= surface.tau_vol(expiry) <= surface.taus[-1]:
-            raise ValueError("requested maturity is outside this snapshot's quotes")
-        # Same pricing engine as Step 7; no alternate beta/delta approximation.
-        pricer = MCMapStore(self.config, (tenor,), self.metadata["levels"], self.root / "shards")
-        frame = pricer.measure(surface, tenor)
-        frame["actual_expiry"] = expiry
-        frame["actual_tau"] = surface.tau_vol(expiry)
-        frame["ref_spot"] = surface.ref_spot
-        path = self.root / "shards" / f"{key}.csv"
-        temporary = path.with_suffix(".tmp")
-        frame.to_csv(temporary, index=False)
-        temporary.replace(path)
-        self.index[key] = {"snapshot": snapshot_signature(surface), "sha256": file_sha256(path)}
-        _atomic_json(self.index_path, self.index)
-        return self.read(surface, tenor)
+        missing = {}
+        for tenor in dict.fromkeys(tenors):
+            key, tenor = self._key(surface, tenor)
+            expiry = date_at_tau(surface, tenor)
+            if not surface.taus[0] <= surface.tau_vol(expiry) <= surface.taus[-1]:
+                raise ValueError("requested maturity is outside this snapshot's quotes")
+            if key in self.index:
+                yield tenor, self.read(surface, tenor)
+            else:
+                missing[tenor] = (key, expiry)
+        if not missing:
+            return
+        pricer = MCMapStore(self.config, missing, self.metadata["levels"], self.root / "shards")
+        frames = pricer.measure_many(surface, missing)
+        for tenor, (key, expiry) in missing.items():
+            frame = frames[tenor]
+            frame["actual_expiry"] = expiry
+            frame["actual_tau"] = surface.tau_vol(expiry)
+            frame["ref_spot"] = surface.ref_spot
+            path = self.root / "shards" / f"{key}.csv"
+            temporary = path.with_suffix(".tmp")
+            frame.to_csv(temporary, index=False)
+            temporary.replace(path)
+            self.index[key] = {"snapshot": snapshot_signature(surface), "sha256": file_sha256(path)}
+            _atomic_json(self.index_path, self.index)
+            yield tenor, self.read(surface, tenor)

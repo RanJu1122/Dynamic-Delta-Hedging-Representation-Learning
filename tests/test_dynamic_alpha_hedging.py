@@ -30,7 +30,7 @@ QUOTE_FILE = Path(__file__).resolve().parent.parent / "data" / "svi_param.pkl"
 
 def test_research_strike_levels_match_the_document():
     assert RESEARCH_STRIKE_LEVELS == tuple(x / 10 for x in range(4, 13))
-    assert RESEARCH_TENORS[:3] == (1 / 12, 2 / 12, 3 / 12)
+    assert RESEARCH_TENORS == (2 / 12, .25, .5, .75, 1., 1.5, 2.)
     assert DEFAULT_DATA_PATH == QUOTE_FILE
 
 

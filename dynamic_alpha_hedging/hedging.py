@@ -114,39 +114,52 @@ class MCMapStore:
         return pd.concat(pieces, ignore_index=True)
 
     def measure(self, raw_surface, tenor):
+        return self.measure_many(raw_surface, (tenor,))[tenor]
+
+    def measure_many(self, raw_surface, tenors):
+        """Share each scalar-Alpha bump pair across this date's requested tenors."""
         c = self.config
         surface = raw_surface.repaired()
-        expiry = date_at_tau(surface, tenor)
+        expiries = {tenor: date_at_tau(surface, tenor) for tenor in tenors}
+        if not expiries:
+            raise ValueError("empty tenor axis")
+        last_expiry = max(expiries.values())
         spot = surface.ref_spot
         bump = c.step3_spot_bump_fraction * spot
         args = dict(n_ratio=c.step3_n_ratio, ratio_min=c.step3_ratio_min,
                     ratio_max=c.step3_ratio_max, vol_floor=c.step3_vol_floor,
                     vol_cap=c.step3_vol_cap)
-        base = LocalVolGrid.build(surface, expiry, **args)
+        base = LocalVolGrid.build(surface, last_expiry, **args)
         mc = LocalVolMC(surface, base, n_paths=c.step3_n_paths, seed=c.step3_seed,
                         n_substeps=c.step3_n_substeps, antithetic=c.step3_antithetic)
-        rows = []
+        rows = {tenor: [] for tenor in expiries}
         for alpha in c.step3_alphas:
             up, down = [LocalVolGrid.build(
-                surface, expiry, spot_adj=np.log((spot + sign*bump)/spot),
+                surface, last_expiry, spot_adj=np.log((spot + sign*bump)/spot),
                 alpha=alpha, **args) for sign in (1, -1)]
-            measured = mc.bumped_implied_vol_diagnostics(
-                np.asarray(self.levels)*spot, expiry, up, down, bump)
-            measured["calibration_date"] = surface.market.pricing_date
-            measured["tenor"], measured["alpha"] = tenor, alpha
-            measured["repair_iv_change"] = np.asarray(surface.implied_vol(
-                expiry, np.asarray(self.levels)*spot)) - np.asarray(raw_surface.implied_vol(
-                    expiry, np.asarray(self.levels)*spot))
-            measured["grid_undefined_fraction"] = max(
-                up.n_undefined, down.n_undefined) / up.sigma.size
-            measured["grid_clipped_fraction"] = max(
-                up.n_clipped, down.n_clipped) / up.sigma.size
-            rows.append(measured)
-        curve = _anchor_at_sticky_strike(pd.concat(rows, ignore_index=True))
-        quality = _cell_quality(curve, c)
-        return curve.merge(quality[["tenor", "level", "quality_pass",
-                                    "inverse_available", "quality_failures"]],
-                           on=["tenor", "level"], validate="many_to_one")
+            measurements = mc.bumped_implied_vol_diagnostics_many(
+                np.asarray(self.levels)*spot, expiries.values(), up, down, bump)
+            for tenor, expiry in expiries.items():
+                measured = measurements[expiry].copy()
+                measured["calibration_date"] = surface.market.pricing_date
+                measured["tenor"], measured["alpha"] = tenor, alpha
+                measured["repair_iv_change"] = np.asarray(surface.implied_vol(
+                    expiry, np.asarray(self.levels)*spot)) - np.asarray(raw_surface.implied_vol(
+                        expiry, np.asarray(self.levels)*spot))
+                prefix_up, prefix_down = up.prefix(expiry), down.prefix(expiry)
+                measured["grid_undefined_fraction"] = max(
+                    prefix_up.n_undefined, prefix_down.n_undefined) / prefix_up.sigma.size
+                measured["grid_clipped_fraction"] = max(
+                    prefix_up.n_clipped, prefix_down.n_clipped) / prefix_up.sigma.size
+                rows[tenor].append(measured)
+        results = {}
+        for tenor, pieces in rows.items():
+            curve = _anchor_at_sticky_strike(pd.concat(pieces, ignore_index=True))
+            quality = _cell_quality(curve, c)
+            results[tenor] = curve.merge(quality[["tenor", "level", "quality_pass",
+                                                "inverse_available", "quality_failures"]],
+                                       on=["tenor", "level"], validate="many_to_one")
+        return results
 
 
 def cell_curve(curves, tenor, level):

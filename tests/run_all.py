@@ -13,6 +13,8 @@ MODULES = (
     "tests.test_dynamic_alpha_hedging",
     "tests.test_step07",
     "tests.test_precompute",
+    "tests.test_shared_precompute",
+    "tests.test_full63_grid",
     "tests.test_exclusion_workflow",
     "tests.test_daily_only",
     "tests.test_shared_step07",

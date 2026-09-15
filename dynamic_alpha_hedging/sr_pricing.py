@@ -1,7 +1,7 @@
-"""Shared-book SR surfaces and multi-expiry MC, independent of the old engine.
+"""Shared-book SR surfaces and multi-expiry MC.
 
-The legacy engine files remain byte-for-byte unchanged so existing converter
-libraries retain their provenance. Only this adapter accepts vector-valued SR.
+This adapter accepts vector-valued SR; scalar-Alpha precompute uses LocalVolMC.
+Both use LocalVolGrid interpolation, and caches track their engine provenance.
 """
 
 from dataclasses import asdict, dataclass, replace

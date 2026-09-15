@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .config import DEFAULT_DATA_PATH, DynamicAlphaConfig, RESEARCH_STRIKE_LEVELS
+from .config import DEFAULT_DATA_PATH, DynamicAlphaConfig, LEGACY56_STRIKE_LEVELS
 
 
 def _config(args) -> DynamicAlphaConfig:
@@ -18,8 +18,8 @@ def _config(args) -> DynamicAlphaConfig:
         source_timezone=getattr(args, "source_timezone", "Asia/Shanghai"),
         market_timezone=getattr(args, "market_timezone", "America/New_York"),
         beta_min_abs_dlogS=getattr(args, "min_abs_dlogS", 0.0025),
-        step4_strike_levels=(RESEARCH_STRIKE_LEVELS if getattr(args, "surface_grid", "legacy56") == "full63"
-                            else defaults.step4_strike_levels),
+        step4_strike_levels=(LEGACY56_STRIKE_LEVELS if getattr(args, "surface_grid", "full63") == "legacy56"
+                            else defaults.strike_levels),
         step3_calibration_date=getattr(args, "calibration_date", None),
         step3_alphas=tuple(getattr(args, "alphas", defaults.step3_alphas)),
         step3_spot_bump_fraction=getattr(
@@ -227,8 +227,8 @@ def cli() -> None:
         shared.add_argument("--prepare", action="store_true", help="fit predictor and validate coverage; no MC")
         _add_date_arguments(shared)
         shared.add_argument("--surface-grid", choices=("legacy56", "full63"),
-                            default="legacy56",
-                            help="must match Step 4-6 and converter nodes; fixed book always has 63 contracts")
+                            default="full63",
+                            help="default full63 matches forecasts, converters and fixed book; legacy56 is an explicit old experiment")
         if command == "step7-fixed":
             selection = shared.add_mutually_exclusive_group()
             selection.add_argument("--strategy-set", choices=("dynamic", "raw_controls", "full"),
@@ -248,8 +248,8 @@ def cli() -> None:
                                 help="aging contracts outside quoted tenors: audited flat boundary IV or fail")
 
     for stage_parser in (step4, step5, step6, step7):
-        stage_parser.add_argument("--surface-grid", choices=("legacy56", "full63"), default="legacy56",
-                                  help="factor/prediction nodes: 7 tenors x 8 or 9 strike levels")
+        stage_parser.add_argument("--surface-grid", choices=("legacy56", "full63"), default="full63",
+                                  help="default full63: 7 tenors x 9 levels; legacy56 must be selected explicitly")
 
     args = parser.parse_args()
     if args.command == "step7":

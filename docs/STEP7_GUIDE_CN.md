@@ -1,5 +1,9 @@
 # Step 7：动态 Alpha 回测框架
 
+> 最新网格已统一为默认 full63：Step 1/2、Step 4–6 预测、precompute、固定 book 均为 7×9。本文其余旧 56 节点说明属于历史实验；当前用法见 [统一 full63 说明](UNIFIED_FULL63_CN.md)。
+
+> 2026-09-14 运行口径更新：三天数据已在代码中恢复，正常 MC 默认 40k，`step7` 默认指向三种动态策略的固定续开 book；旧逐合约入口改名 `step7-legacy`。本文其余旧命令/数值按原实验理解，新重跑请使用[当前迁移说明](MC_REBUILD_40K_AND_THREE_STRATEGIES_CN.md)。
+
 新增的解析 delta 对照、训练期多日期转换器、MC 一致性检查和已完成的缓存复算，
 见 [Delta 与转换器对照](STEP7_DELTA_COMPARISON_CN.md)。下文开头的“未运行”描述为框架初版状态，
 不代表目前没有回测输出。

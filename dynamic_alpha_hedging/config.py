@@ -17,12 +17,15 @@ from .data_loader import MarketConventions
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "svi_param.pkl"
 RESEARCH_TENORS: tuple[float, ...] = (
-    1 / 12, 2 / 12, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+    2 / 12, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
 # The document's literal grid is 0.4, 0.5, ..., 1.2.  Finer grids belong in
 # an explicit sensitivity run rather than silently changing the baseline.
 RESEARCH_STRIKE_LEVELS: tuple[float, ...] = tuple(x / 10 for x in range(4, 13))
-STEP4_TENORS: tuple[float, ...] = RESEARCH_TENORS[1:]
-STEP4_STRIKE_LEVELS: tuple[float, ...] = tuple(x / 10 for x in range(4, 12))
+# One default grid for observations, forecasts, converters and book slots.
+# Keep the Step 4 names as aliases for existing Python callers.
+STEP4_TENORS: tuple[float, ...] = RESEARCH_TENORS
+STEP4_STRIKE_LEVELS: tuple[float, ...] = RESEARCH_STRIKE_LEVELS
+LEGACY56_STRIKE_LEVELS: tuple[float, ...] = RESEARCH_STRIKE_LEVELS[:-1]
 
 
 @dataclass(frozen=True)
@@ -94,15 +97,9 @@ class DynamicAlphaConfig:
         if not self.strike_levels or min(self.strike_levels) <= 0:
             raise ValueError("strike levels must be strictly positive")
         if self.step4_tenors is None:
-            selected = tuple(x for x in self.tenors if x in STEP4_TENORS)
-            object.__setattr__(
-                self, "step4_tenors", selected if selected else self.tenors)
+            object.__setattr__(self, "step4_tenors", self.tenors)
         if self.step4_strike_levels is None:
-            selected = tuple(
-                x for x in self.strike_levels if x in STEP4_STRIKE_LEVELS)
-            object.__setattr__(
-                self, "step4_strike_levels",
-                selected if selected else self.strike_levels)
+            object.__setattr__(self, "step4_strike_levels", self.strike_levels)
         if self.step4_anchor_tenor is None:
             object.__setattr__(
                 self, "step4_anchor_tenor",

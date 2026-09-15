@@ -117,6 +117,8 @@ class LocalVolGrid:
     n_undefined: int              # grid points where localvol returned NaN
     n_clipped: int                # finite points the cap/floor actually moved
     n_zero: int                   # points where sigma_loc is exactly zero
+    undefined_by_date: np.ndarray | None = field(default=None, repr=False)
+    clipped_by_date: np.ndarray | None = field(default=None, repr=False)
 
     @classmethod
     def build(cls, surface: VolSurface, maturity, n_ratio: int = 1000,
@@ -173,7 +175,26 @@ class LocalVolGrid:
                    tau_r=np.array([surface.tau_r(d) for d in dates]),
                    ratios=ratios, sigma=sigma,
                    vol_floor=vol_floor, vol_cap=vol_cap,
-                   n_undefined=n_undefined, n_clipped=n_clipped, n_zero=n_zero)
+                   n_undefined=n_undefined, n_clipped=n_clipped, n_zero=n_zero,
+                   undefined_by_date=(~np.isfinite(raw)).sum(axis=1),
+                   clipped_by_date=(np.isfinite(raw) & (filled != sigma)).sum(axis=1))
+
+    def prefix(self, maturity) -> "LocalVolGrid":
+        """View through an exact expiry, retaining that prefix's repair counts."""
+        end = self.dates.index(to_date(maturity)) + 1
+        if end == len(self.dates):
+            return self
+        if self.undefined_by_date is None or self.clipped_by_date is None:
+            raise ValueError("grid prefix requires per-date repair counts from build()")
+        sigma = self.sigma[:end]
+        return LocalVolGrid(
+            dates=self.dates[:end], tau_vol=self.tau_vol[:end], tau_r=self.tau_r[:end],
+            ratios=self.ratios, sigma=sigma, vol_floor=self.vol_floor, vol_cap=self.vol_cap,
+            n_undefined=int(self.undefined_by_date[:end].sum()),
+            n_clipped=int(self.clipped_by_date[:end].sum()),
+            n_zero=int(np.count_nonzero(sigma == 0.)),
+            undefined_by_date=self.undefined_by_date[:end],
+            clipped_by_date=self.clipped_by_date[:end])
 
     def sigma_at(self, date_index: int, ratio: np.ndarray) -> np.ndarray:
         """Linear interpolation along the ratio axis at a fixed date index."""
@@ -287,12 +308,25 @@ class LocalVolMC:
 
     def terminal_spots(self, s0: float, z: np.ndarray | None = None,
                        store_paths: bool = False,
-                       return_integrated_variance: bool = False):
+                       return_integrated_variance: bool = False, *,
+                       snapshot_indices: Sequence[int] | None = None):
         """Evolve S from the pricing date to the last grid date.
 
         The local volatility is re-interpolated in BOTH state and time at every
         sub-step, so refining `n_substeps` refines the whole scheme.
+
+        With snapshot_indices, return {date_index: spots} at those grid dates.
+        The stepping arithmetic and random-number order are unchanged.
         """
+        if snapshot_indices is not None:
+            if store_paths or return_integrated_variance:
+                raise ValueError("snapshots cannot be combined with other storage modes")
+            snapshot_indices = set(snapshot_indices)
+            if not snapshot_indices or any(
+                    not isinstance(i, (int, np.integer)) or not 0 < i <= len(self.dt_r)
+                    for i in snapshot_indices):
+                raise ValueError("snapshot indices must be positive exact grid indices")
+        snapshots = {}
         z = self._draw() if z is None else z
         n_eff = z.shape[1]
         s = np.full(n_eff, float(s0))
@@ -316,6 +350,10 @@ class LocalVolMC:
                                + sig * rt * z[i * m + j])
             if store_paths:
                 paths[i + 1] = s
+            if snapshot_indices is not None and i + 1 in snapshot_indices:
+                snapshots[i + 1] = s.copy()
+        if snapshot_indices is not None:
+            return snapshots
         if store_paths and return_integrated_variance:
             return s, paths, integrated_variance
         if store_paths:
@@ -451,6 +489,7 @@ class LocalVolMC:
 
         hv = np.repeat(self.dt_v / self.n_substeps, self.n_substeps)
         brownian = (np.sqrt(hv)[:, None] * z).sum(axis=0)
+
         rows = []
         for strike in strikes:
             sigma_imp = float(self.surface.implied_vol(maturity, strike))
@@ -594,14 +633,64 @@ class LocalVolMC:
         terminal_lv_up = mc_up.terminal_spots(s_up, z)
         terminal_lv_down = mc_down.terminal_spots(s_down, z)
 
-        df = self.surface.discount_factor(maturity)
-        tau_v = self.surface.tau_vol(maturity)
-        tau_r = self.surface.tau_r(maturity)
-        carry = float(np.exp(self.b * tau_r))
-        f0, f_up, f_down = s0 * carry, s_up * carry, s_down * carry
-        dlog_spot = float(np.log(s_up / s_down))
         hv = np.repeat(self.dt_v / self.n_substeps, self.n_substeps)
         brownian = (np.sqrt(hv)[:, None] * z).sum(axis=0)
+
+        return self._bumped_diagnostics_from_terminal(
+            strikes, maturity, grid_up, grid_down, bump,
+            terminal_lv_up, terminal_lv_down, brownian)
+
+    def bumped_implied_vol_diagnostics_many(
+            self, strikes: Sequence[float], maturities: Sequence,
+            grid_up: LocalVolGrid, grid_down: LocalVolGrid, bump: float) -> dict:
+        """Price multiple expiries from one pair of paths to the last expiry.
+
+        Retains the single-expiry estimator, including its Brownian reduction
+        order, so common-seed results agree without changing the MC sample.
+        """
+        maturities = sorted(set(to_date(d) for d in maturities))
+        if not maturities:
+            raise ValueError("empty maturity axis")
+        self._check_horizon(maturities[-1])
+        indices = [self.grid.dates.index(d) for d in maturities]
+        strikes = np.asarray(strikes, dtype=float)
+        if strikes.ndim != 1 or strikes.size == 0:
+            raise ValueError("strikes must be a non-empty one-dimensional array")
+        s0 = float(self.surface.market.spot)
+        if not 0.0 < bump < s0:
+            raise ValueError("bump must be strictly between zero and spot")
+        for g in (grid_up, grid_down):
+            if g.dates != self.grid.dates or not np.array_equal(g.ratios, self.grid.ratios):
+                raise ValueError("bump grids must have identical axes")
+        settings = dict(n_paths=self.n_paths, seed=self.seed,
+                        antithetic=self.antithetic, n_substeps=self.n_substeps)
+        z = self._draw()
+        up = LocalVolMC(self.surface, grid_up, **settings).terminal_spots(
+            s0+bump, z, snapshot_indices=indices)
+        down = LocalVolMC(self.surface, grid_down, **settings).terminal_spots(
+            s0-bump, z, snapshot_indices=indices)
+        hv = np.repeat(self.dt_v / self.n_substeps, self.n_substeps)
+        results = {}
+        for maturity, index in zip(maturities, indices):
+            steps = index * self.n_substeps
+            brownian = (np.sqrt(hv[:steps])[:, None] * z[:steps]).sum(axis=0)
+            prefix = LocalVolMC(self.surface, self.grid.prefix(maturity), **settings)
+            results[maturity] = prefix._bumped_diagnostics_from_terminal(
+                strikes, maturity, grid_up.prefix(maturity), grid_down.prefix(maturity),
+                bump, up[index], down[index], brownian)
+        return results
+
+    def _bumped_diagnostics_from_terminal(
+            self, strikes, maturity, grid_up, grid_down, bump,
+            terminal_lv_up, terminal_lv_down, brownian):
+        """Common payoff, control-variate, IV and Beta estimator for both runners."""
+        s0 = float(self.surface.market.spot)
+        s_up, s_down = s0 + bump, s0 - bump
+        df = self.surface.discount_factor(maturity)
+        tau_v, tau_r = self.surface.tau_vol(maturity), self.surface.tau_r(maturity)
+        carry = float(np.exp(self.b * tau_r))
+        f_up, f_down = s_up * carry, s_down * carry
+        dlog_spot = float(np.log(s_up / s_down))
 
         rows: list[dict] = []
         for strike in strikes:

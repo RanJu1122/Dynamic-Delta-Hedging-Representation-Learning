@@ -568,6 +568,10 @@ def run_fixed_step7(inputs, *, outdir, options=FixedStep7Config(), mc_config=Non
             n_initial_options=int(cohorts["test"].generation.eq(0).sum()),
             n_test_contract_generations=len(cohorts["test"]),
             signal_nodes=len(c.step4_tenors)*len(c.step4_strike_levels),
+            signal_tenors=c.step4_tenors, signal_levels=c.step4_strike_levels,
+            book_tenors=options.book_tenors, book_levels=options.book_levels,
+            signal_book_axes_match=(tuple(c.step4_tenors) == tuple(options.book_tenors)
+                                    and tuple(c.step4_strike_levels) == tuple(options.book_levels)),
             training_inception=cohorts["train"].inception.iloc[0] if "train" in cohorts else None,
             test_inception=cohorts["test"].inception.iloc[0],
             diagnostic_date_limits=bool(options.max_train_dates or options.max_test_dates),

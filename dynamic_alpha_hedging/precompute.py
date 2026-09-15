@@ -146,7 +146,9 @@ def run_precompute(config, *, outdir, tenors, levels, plot_count=3, plan_only=Fa
     validation = {
         "status": "planned", "mc_run": False,
         "observation_count": len(history.dates), "date_tenor_jobs": len(work),
-        "bump_pairs_before_cache": len(work)*len(config.step3_alphas),
+        "bump_pairs_before_cache": work.date.nunique()*len(config.step3_alphas),
+        "independent_bump_pairs_before_cache": len(work)*len(config.step3_alphas),
+        "path_policy": "same-date scalar-alpha bump paths shared across missing tenors",
         "unsupported_date_tenor_cells": int((~coverage.supported).sum()),
         "excluded_observation_dates": observation_exclusions(),
         "plot_dates": selected, "requested_plot_count": plot_count, "plots": [],
@@ -188,18 +190,19 @@ def run_precompute(config, *, outdir, tenors, levels, plot_count=3, plan_only=Fa
         audits, pictures, chosen = [], [], {}
         active_job = None
         try:
-            for n, row in enumerate(work.itertuples(index=False), 1):
-                active_job = {"date": row.date, "tenor": row.tenor}
-                progress(f"Precompute {n}/{len(work)}: {row.date}, tenor={row.tenor:g}")
-                key, _ = library._key(history[row.date], row.tenor)
-                reused = key in library.index
-                frame = library.ensure(history[row.date], row.tenor)
-                audits.append(_cell_quality(frame, config))
-                validation["completed_jobs"] += 1
-                validation["reused_jobs" if reused else "computed_jobs"] += 1
-                manifest("manifest.json")
-                if row.date in selected:
-                    chosen.setdefault(row.date, []).append(frame)
+            for date, group in work.groupby("date", sort=False):
+                tenors_today = tuple(group.tenor)
+                active_job = {"date": date, "tenors": tenors_today}
+                progress(f"Precompute {date}: {len(tenors_today)} tenors, shared paths "
+                         f"({validation['completed_jobs']}/{len(work)} shards complete)")
+                cached = {t for t in tenors_today if library._key(history[date], t)[0] in library.index}
+                for tenor, frame in library.ensure_many(history[date], tenors_today):
+                    audits.append(_cell_quality(frame, config))
+                    validation["completed_jobs"] += 1
+                    validation["reused_jobs" if tenor in cached else "computed_jobs"] += 1
+                    manifest("manifest.json")
+                    if date in selected:
+                        chosen.setdefault(date, []).append(frame)
             active_job = {"phase": "quality_reports_and_plots"}
             quality = pd.concat(audits, ignore_index=True)
             _csv(quality, target / "quality.csv")

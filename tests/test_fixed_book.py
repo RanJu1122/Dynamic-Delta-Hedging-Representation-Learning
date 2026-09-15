@@ -215,9 +215,13 @@ def test_new_mc_accepts_aging_fixed_strikes_and_hits_cache(tmp_path):
     assert pricer.computed == pricer.reused == 1
 
 
-def test_signal_grid_is_explicit_and_legacy_default_unchanged():
-    legacy = _config(SimpleNamespace())
+def test_signal_grid_defaults_to_full63_and_legacy_requires_explicit_choice():
+    default = _config(SimpleNamespace())
+    legacy = _config(SimpleNamespace(surface_grid="legacy56"))
     full = _config(SimpleNamespace(surface_grid="full63"))
+    assert default == full
+    assert default.tenors == default.step4_tenors == FixedStep7Config().book_tenors
+    assert default.strike_levels == default.step4_strike_levels == FixedStep7Config().book_levels
     assert len(legacy.step4_tenors)*len(legacy.step4_strike_levels) == 56
     assert len(full.step4_tenors)*len(full.step4_strike_levels) == 63
     assert len(FixedStep7Config().book_tenors)*len(FixedStep7Config().book_levels) == 63

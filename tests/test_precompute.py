@@ -61,11 +61,15 @@ def measured(store, surface, tenor):
                                  "quality_failures"]], on=["tenor", "level"])
 
 
+def measured_many(store, surface, tenors):
+    return {tenor: measured(store, surface, tenor) for tenor in tenors}
+
+
 @contextmanager
 def fake_pricing():
     signature = engine_signature()
     with patch("dynamic_alpha_hedging.mc_library.engine_signature", return_value=signature), \
-         patch.object(MCMapStore, "measure", autospec=True, side_effect=measured) as calls:
+         patch.object(MCMapStore, "measure_many", autospec=True, side_effect=measured_many) as calls:
         yield calls
 
 
@@ -145,10 +149,10 @@ def test_plan_only_and_invalid_axes_preserve_existing_reports():
 def test_failed_precompute_records_progress_and_resumes():
     with sample() as (root, config, history), fake_pricing() as calls, patch(
             "dynamic_alpha_hedging.precompute._plots", return_value=[]):
-        def fail_second(store, surface, tenor):
+        def fail_second(store, surface, tenors):
             if surface.market.pricing_date == history.dates[1]:
                 raise RuntimeError("pricing failed for test")
-            return measured(store, surface, tenor)
+            return measured_many(store, surface, tenors)
         calls.side_effect = fail_second
         out = root / "library"
         with raises(RuntimeError, "pricing failed"):
@@ -156,7 +160,7 @@ def test_failed_precompute_records_progress_and_resumes():
         manifest = json.loads((out / "manifest.json").read_text())["validation"]
         assert manifest["status"] == "failed" and manifest["completed_jobs"] == 1
         assert manifest["failed_job"]["date"] == str(history.dates[1])
-        calls.side_effect = measured
+        calls.side_effect = measured_many
         result = run(config, out)
         assert result["status"] == "complete"
         assert result["reused_jobs"] == 1 and result["computed_jobs"] == 2

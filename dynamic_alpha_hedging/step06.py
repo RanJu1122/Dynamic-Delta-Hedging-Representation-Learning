@@ -25,6 +25,7 @@ from sklearn.preprocessing import StandardScaler
 
 from .artifacts import file_sha256, write_manifest
 from .config import DynamicAlphaConfig
+from .grid import validate_cells
 from .step05 import FACTOR_COLUMNS, STATE_FEATURES
 
 
@@ -103,6 +104,8 @@ def _ordered_loadings(loadings: pd.DataFrame, config: DynamicAlphaConfig
     missing = required.difference(loadings.columns)
     if missing:
         raise ValueError(f"Step 4 factor loadings miss {sorted(missing)}")
+    validate_cells(loadings, config.step4_tenors, config.step4_strike_levels,
+                   source="Step 4 loadings")
     values = _canonical_axes(loadings, config)
     if values.duplicated(["tenor", "level"]).any():
         raise ValueError("Step 4 loadings contain duplicate cells")
