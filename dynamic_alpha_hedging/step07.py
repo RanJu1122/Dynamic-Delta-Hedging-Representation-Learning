@@ -17,6 +17,7 @@ import pandas as pd
 from svi_localvol.conventions import nb_biz_days
 from .artifacts import file_sha256, read_manifest, write_manifest
 from .config import DynamicAlphaConfig
+from .factors import schema_for, copy_metadata
 from .data_loader import load_surface_history, observation_exclusions
 from .hedging import (MCMapStore, cell_curve, contract_interval, invert_beta,
                       delta_at_alpha)
@@ -107,6 +108,16 @@ def prepare_step7(config=DynamicAlphaConfig(), settings=Step7Config(), *,
         sources[step + "_manifest"] = str(path)
         sources[step + "_manifest_sha256"] = file_sha256(path)
     stored = manifest["config"]
+    method = stored.get("step4_factor_method", "atm_anchored")
+    if config.step4_factor_method != method:
+        raise ValueError("Step 7 factor method differs from Step 6")
+    for step in ("step04", "step05"):
+        upstream = read_manifest(root / step / "manifest.json")
+        if upstream["config"].get("step4_factor_method", "atm_anchored") != method:
+            raise ValueError(f"{step} factor method mismatch; rebuild downstream")
+        if upstream["validation"].get("factor_basis_id") != manifest["validation"].get("factor_basis_id"):
+            raise ValueError(f"{step} factor basis mismatch; rebuild downstream")
+
     for key in ("beta_min_abs_dlogS", "step4_train_fraction", "rate", "dividend",
                 "repo", "holidays", "step4_anchor_tenor", "step4_anchor_level",
                 "step4_tenors", "step4_strike_levels", "tenors", "strike_levels"):
@@ -129,9 +140,11 @@ def prepare_step7(config=DynamicAlphaConfig(), settings=Step7Config(), *,
     features = features[features.observation_date >= forecaster.train_end]
     forecasts = forecaster.predict(features).set_index("observation_date")
     naive = forecaster.naive_predict(features).set_index("observation_date")
-    for factor, last in zip(FACTOR_COLUMNS, LAST_FACTOR_COLUMNS):
+    schema = schema_for(loadings)
+    for factor, last in zip(schema.scores, schema.last):
         forecasts[last] = naive[factor]
-    forecasts["naive_uses_close_t_factors"] = features.set_index("observation_date")[list(FACTOR_COLUMNS)].notna().all(axis=1)
+    forecasts["naive_uses_close_t_factors"] = features.set_index("observation_date")[list(schema.scores)].notna().all(axis=1)
+    copy_metadata(loadings, forecasts)
     ordered = _ordered_loadings(loadings, config)
     tenors, levels = settings.axes(config)
     for tenor in tenors:
@@ -252,7 +265,8 @@ def run_step7(inputs, *, outdir, map_store=None, cache_dir=None, progress=print)
         raise ValueError("Step 7 requires training and test holding intervals")
     if any(p not in inputs.forecasts.index for p, _ in testing):
         raise ValueError("missing close-t forecast: generate signals on every market date")
-    required_forecasts = {*FACTOR_COLUMNS, *LAST_FACTOR_COLUMNS, "naive_uses_close_t_factors"}
+    schema = schema_for(inputs.loadings)
+    required_forecasts = {*schema.scores, *schema.last, "naive_uses_close_t_factors"}
     missing = required_forecasts.difference(inputs.forecasts.columns)
     if missing:
         raise ValueError(f"missing daily-only model/persistence forecast columns: {sorted(missing)}")
@@ -344,15 +358,14 @@ def run_step7(inputs, *, outdir, map_store=None, cache_dir=None, progress=print)
         table = table_at(previous)
         map_rows.append(table)
         update_alpha_history(table, previous)
-        z = inputs.forecasts.loc[previous, list(FACTOR_COLUMNS)].to_numpy(float)
-        naive_z = inputs.forecasts.loc[previous, list(LAST_FACTOR_COLUMNS)].to_numpy(float)
+        z = inputs.forecasts.loc[previous, list(schema.scores)].to_numpy(float)
+        naive_z = inputs.forecasts.loc[previous, list(schema.last)].to_numpy(float)
         day_rows = []
         for row in marks.itertuples(index=False):
             cell = row.tenor, row.level
             loading = inputs.loadings.loc[cell]
             beta = float(loading.factor_intercept + z[:settings.factor_count] @
-                         loading[["atm_beta_loading", "shape_loading_1",
-                                  "shape_loading_2"]].to_numpy(float)[:settings.factor_count])
+                         loading[list(schema.loadings)].to_numpy(float)[:settings.factor_count])
             if not np.isfinite(beta):
                 raise ValueError(f"nonfinite close-t beta forecast: {previous}, {cell}")
             curve, inverse = cell_curve(table, *cell), converter(table, cell)
@@ -364,7 +377,7 @@ def run_step7(inputs, *, outdir, map_store=None, cache_dir=None, progress=print)
             decay = 0.0 if settings.alpha_half_life == 0 else 2**(-1/settings.alpha_half_life)
             smoothed[cell] = decay*smoothed[cell] + (1-decay)*raw
             naive_beta = float(loading.factor_intercept + naive_z[:settings.factor_count] @
-                               loading[["atm_beta_loading", "shape_loading_1", "shape_loading_2"]].to_numpy(float)[:settings.factor_count])
+                               loading[list(schema.loadings)].to_numpy(float)[:settings.factor_count])
             if not np.isfinite(naive_beta):
                 raise ValueError(f"nonfinite persistence forecast: {previous}, {cell}")
             naive_alpha, naive_clipped, naive_fallback = invert_beta(inverse, naive_beta)
@@ -415,7 +428,7 @@ def run_step7(inputs, *, outdir, map_store=None, cache_dir=None, progress=print)
                     "naive_beta": naive_beta,
                     "naive_uses_close_t_factors": bool(inputs.forecasts.loc[previous, "naive_uses_close_t_factors"]),
                     "alpha": alpha,
-                    **dict(zip(FACTOR_COLUMNS, naive_z if strategy == "last_observed_factor" else z)),
+                    **dict(zip(schema.scores, naive_z if strategy == "last_observed_factor" else z)),
                     "converter_date": (None if direct or strategy == "bs_delta" else
                                        previous if reference is None else
                                        reference.calibration_date.iloc[0]),

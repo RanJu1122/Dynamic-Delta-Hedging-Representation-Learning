@@ -15,11 +15,13 @@ MODULES = (
     "tests.test_precompute",
     "tests.test_shared_precompute",
     "tests.test_full63_grid",
+    "tests.test_factor_methods",
     "tests.test_exclusion_workflow",
     "tests.test_daily_only",
     "tests.test_shared_step07",
     "tests.test_fixed_book",
     "tests.test_mc_revision",
+    "tests.test_control_variates",
 )
 
 

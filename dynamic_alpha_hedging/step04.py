@@ -1,19 +1,7 @@
-"""Dynamic Alpha Step 4: an ATM-anchored factor model of daily beta.
+"""Train-only daily-beta decomposition: ATM anchor or ordinary centered PCA.
 
-Each observation is one complete daily ``(tenor, strike level)`` beta
-surface.  The factorisation is deliberately identified in beta units:
-
-    beta(t, cell)
-        ~= intercept(cell)
-          + atm_beta(t) * atm_beta_loading(cell)
-          + shape_score_1(t) * shape_loading_1(cell)
-          + shape_score_2(t) * shape_loading_2(cell).
-
-``atm_beta`` is the observed 3M ATM daily beta, not an unconstrained PC.  The
-two shape PCs are fitted to the residual surface after regressing every cell
-on that ATM factor.  Hence the anchor has ATM loading one and both shape
-loadings zero.  Loadings are fitted on the chronological training sample only;
-later surfaces are merely projected onto the frozen loadings.
+Both methods retain three factors, fit only chronological training dates and
+project later observations onto the frozen basis. PCA is not standardized.
 """
 
 from __future__ import annotations
@@ -27,6 +15,7 @@ import pandas as pd
 
 from .artifacts import file_sha256, write_manifest
 from .config import DynamicAlphaConfig
+from .factors import schema_for, basis_id
 
 
 BETA_COLUMN = "beta_surface_daily"
@@ -37,7 +26,7 @@ REQUIRED_COLUMNS = {"observation_date", "tenor", "level", BETA_COLUMN}
 
 @dataclass
 class Step4Result:
-    """The fitted ATM-plus-two-shape factor model and its diagnostics."""
+    """A fitted three-factor model and its reconstruction diagnostics."""
 
     config: DynamicAlphaConfig
     explained_variance: pd.DataFrame
@@ -46,6 +35,7 @@ class Step4Result:
     reconstruction_by_cell: pd.DataFrame
     date_coverage: pd.DataFrame
     validation: dict[str, object]
+    surface_examples: pd.DataFrame
 
 
 def load_step2_beta(path: str | Path) -> pd.DataFrame:
@@ -98,6 +88,7 @@ def _surface_matrix(beta: pd.DataFrame, config: DynamicAlphaConfig
     for flag in ("daily_ratio_usable", "is_next_business_observation"):
         if flag in beta:
             valid &= _as_bool(beta[flag])
+    valid &= np.isfinite(beta[BETA_COLUMN])
     beta.loc[~valid, BETA_COLUMN] = np.nan
 
     configured = pd.MultiIndex.from_product(
@@ -127,7 +118,7 @@ def _surface_matrix(beta: pd.DataFrame, config: DynamicAlphaConfig
     complete = matrix.dropna(axis=0, how="any")
     if complete.shape[1] < N_FACTORS:
         raise ValueError(
-            f"ATM plus two shape factors need at least {N_FACTORS} beta cells; "
+            f"Three-factor decomposition needs at least {N_FACTORS} beta cells; "
             f"found {complete.shape[1]}")
     if len(complete) < N_FACTORS + 1:
         raise ValueError(
@@ -167,7 +158,8 @@ def _cell_r_squared(actual: np.ndarray, fitted: np.ndarray,
 
 def run_step4(beta: pd.DataFrame,
               config: DynamicAlphaConfig = DynamicAlphaConfig()) -> Step4Result:
-    """Fit an ATM factor and two residual PCs to daily beta surfaces."""
+    """Fit the configured basis, then evaluate nested 1/2/3-factor reconstructions."""
+    schema = schema_for(config.step4_factor_method)
     matrix, date_coverage = _surface_matrix(beta, config)
     values = matrix.to_numpy(dtype=float)
     n_dates = len(values)
@@ -183,30 +175,45 @@ def run_step4(beta: pd.DataFrame,
     except KeyError as exc:
         raise ValueError(f"Step 4 anchor {anchor} is absent from axes") from exc
 
-    # Factor 1 is observed directly.  Cell regressions use training dates only.
     atm_beta = values[:, anchor_index]
-    design_train = np.column_stack([np.ones(split), atm_beta[:split]])
-    coefficients, _, _, _ = np.linalg.lstsq(design_train, train, rcond=None)
-    factor_intercept = coefficients[0]
-    atm_loading = coefficients[1]
-    factor_intercept[anchor_index] = 0.0
-    atm_loading[anchor_index] = 1.0
+    if schema.method == "atm_anchored":
+        # Factor 1 is observed directly.  Cell regressions use training dates only.
+        design_train = np.column_stack([np.ones(split), atm_beta[:split]])
+        coefficients, _, _, _ = np.linalg.lstsq(design_train, train, rcond=None)
+        factor_intercept = coefficients[0]
+        atm_loading = coefficients[1]
+        factor_intercept[anchor_index] = 0.0
+        atm_loading[anchor_index] = 1.0
 
-    one_factor = factor_intercept + atm_beta[:, None] * atm_loading
-    residual = values - one_factor
-    residual[:, anchor_index] = 0.0
-    _, singular_values, vt = np.linalg.svd(
-        residual[:split], full_matrices=False)
-    shape_loadings = vt[:N_SHAPE_COMPONENTS]
-    shape_scores = residual @ shape_loadings.T
-    shape_loadings, shape_scores = _orient_components(
-        shape_loadings, shape_scores)
+        one_factor = factor_intercept + atm_beta[:, None] * atm_loading
+        residual = values - one_factor
+        residual[:, anchor_index] = 0.0
+        _, singular_values, vt = np.linalg.svd(
+            residual[:split], full_matrices=False)
+        shape_loadings = vt[:N_SHAPE_COMPONENTS]
+        shape_scores = residual @ shape_loadings.T
+        shape_loadings, shape_scores = _orient_components(
+            shape_loadings, shape_scores)
 
-    reconstructions = [one_factor]
-    for k in range(N_SHAPE_COMPONENTS):
-        reconstructions.append(
-            reconstructions[-1]
-            + shape_scores[:, [k]] * shape_loadings[[k], :])
+        components = np.vstack([atm_loading, shape_loadings])
+        factor_scores = np.column_stack([atm_beta, shape_scores])
+        factor_types = ("observed_anchor", "residual_pca", "residual_pca")
+        reported_singular_values = (np.nan, singular_values[0], singular_values[1])
+    else:
+        factor_intercept = train_mean.copy()
+        centered = values - train_mean
+        _, singular_values, vt = np.linalg.svd(centered[:split], full_matrices=False)
+        components = vt[:N_FACTORS]
+        factor_scores = centered @ components.T
+        components, factor_scores = _orient_components(components, factor_scores)
+        factor_types = ("pca",) * N_FACTORS
+        reported_singular_values = singular_values[:N_FACTORS]
+
+    reconstructed = np.broadcast_to(factor_intercept, values.shape).copy()
+    reconstructions = []
+    for k in range(N_FACTORS):
+        reconstructed = reconstructed + factor_scores[:, [k]] * components[[k], :]
+        reconstructions.append(reconstructed)
 
     train_baseline = np.broadcast_to(train_mean, train.shape)
     test_baseline = np.broadcast_to(train_mean, test.shape)
@@ -221,13 +228,12 @@ def run_step4(beta: pd.DataFrame,
         _r_squared(values, fitted, full_baseline)
         for fitted in reconstructions]
 
-    factor_names = ("atm_beta_factor", "shape_score_1", "shape_score_2")
+    factor_names = schema.scores
     explained = pd.DataFrame({
         "factor_number": np.arange(1, N_FACTORS + 1),
         "factor": factor_names,
-        "factor_type": ("observed_anchor", "residual_pca", "residual_pca"),
-        "residual_pca_singular_value": (
-            np.nan, singular_values[0], singular_values[1]),
+        "factor_type": factor_types,
+        "pca_singular_value": reported_singular_values,
         "incremental_train_explained_variance_ratio": np.diff(
             np.r_[0.0, train_r2]),
         "cumulative_train_explained_variance_ratio": train_r2,
@@ -238,21 +244,22 @@ def run_step4(beta: pd.DataFrame,
     })
 
     axes = matrix.columns.to_frame(index=False)
-    loadings = axes.assign(
-        mean_beta_train=train_mean,
-        factor_intercept=factor_intercept,
-        atm_beta_loading=atm_loading,
-        shape_loading_1=shape_loadings[0],
-        shape_loading_2=shape_loadings[1],
-    )
+    loadings = axes.assign(mean_beta_train=train_mean, factor_intercept=factor_intercept)
     scores = pd.DataFrame({
         "observation_date": matrix.index,
         "sample": np.where(np.arange(n_dates) < split, "train", "test"),
         "atm_beta_observed": atm_beta,
-        "atm_beta_factor": atm_beta,
-        "shape_score_1": shape_scores[:, 0],
-        "shape_score_2": shape_scores[:, 1],
     })
+    for k, (score, loading) in enumerate(zip(schema.scores, schema.loadings)):
+        loadings[loading] = components[k]
+        scores[score] = factor_scores[:, k]
+    fitted_id = basis_id(schema.method, axes.to_numpy().tolist(), matrix.index[:split],
+                         train, factor_intercept, components)
+    for frame in (scores, loadings, explained):
+        frame["factor_method"] = schema.method
+        frame["factor_basis_id"] = fitted_id
+    if schema.method == "atm_anchored":
+        explained["residual_pca_singular_value"] = reported_singular_values
     for n_factors, fitted in enumerate(reconstructions, start=1):
         scores[f"reconstruction_rmse_{n_factors}factor"] = np.sqrt(
             np.mean((values - fitted) ** 2, axis=1))
@@ -279,8 +286,11 @@ def run_step4(beta: pd.DataFrame,
         float(x) for x in config.tenors if x not in retained_tenors)
     excluded_levels = tuple(
         float(x) for x in config.strike_levels if x not in retained_levels)
-    anchor_row = loadings.iloc[anchor_index]
     validation = {
+        "factor_method": schema.method,
+        "factor_basis_id": fitted_id,
+        "factor_columns": schema.scores,
+        "loading_columns": schema.loadings,
         "input_beta_column": BETA_COLUMN,
         "input_date_count": int(beta["observation_date"].nunique()),
         "complete_surface_date_count": int(n_dates),
@@ -307,8 +317,9 @@ def run_step4(beta: pd.DataFrame,
         "full_surface_input": bool(
             matrix.shape[1] == len(retained_tenors) * len(retained_levels)),
         "n_factors": N_FACTORS,
-        "n_observed_anchor_factors": 1,
-        "n_residual_pca_factors": N_SHAPE_COMPONENTS,
+        "n_observed_anchor_factors": int(schema.method == "atm_anchored"),
+        "n_residual_pca_factors": N_SHAPE_COMPONENTS if schema.method == "atm_anchored" else 0,
+        "n_ordinary_pca_factors": N_FACTORS if schema.method == "pca" else 0,
         "centered": True,
         "variance_standardized": False,
         "one_factor_train_explained_variance_ratio": float(train_r2[0]),
@@ -320,28 +331,39 @@ def run_step4(beta: pd.DataFrame,
         "three_factor_train_85pct_pass": bool(train_r2[2] >= 0.85),
         "anchor_tenor": float(config.step4_anchor_tenor),
         "anchor_level": float(config.step4_anchor_level),
-        "anchor_atm_loading": float(anchor_row["atm_beta_loading"]),
-        "anchor_shape_loading_1": float(anchor_row["shape_loading_1"]),
-        "anchor_shape_loading_2": float(anchor_row["shape_loading_2"]),
-        "anchor_normalization_pass": bool(
-            np.isclose(anchor_row["atm_beta_loading"], 1.0)
-            and np.isclose(anchor_row["shape_loading_1"], 0.0)
-            and np.isclose(anchor_row["shape_loading_2"], 0.0)),
-        "anchor_beta_reconstruction_rmse": 0.0,
-        "model": (
-            "beta_hat = factor_intercept + atm_beta_factor * "
-            "atm_beta_loading + shape_score_1 * shape_loading_1 + "
-            "shape_score_2 * shape_loading_2"),
+        "anchor_normalization_required": schema.method == "atm_anchored",
+        "anchor_normalization_pass": (bool(
+            np.isclose(components[0, anchor_index], 1.0)
+            and np.allclose(components[1:, anchor_index], 0.0)
+            and np.isclose(factor_intercept[anchor_index], 0.0))
+            if schema.method == "atm_anchored" else None),
+        "anchor_beta_reconstruction_rmse": float(np.sqrt(np.mean(
+            (reconstructions[-1][:, anchor_index] - atm_beta) ** 2))),
+        "model": "beta_hat = factor_intercept + " + " + ".join(
+            f"{score} * {loading}" for score, loading in zip(schema.scores, schema.loadings)),
         "factor_parameterization": (
-            "factor 1 is observed 3M ATM daily beta; factors 2-3 are PCs "
-            "of the train-sample residual surface"),
+            "observed ATM beta plus two train-residual PCs" if schema.method == "atm_anchored"
+            else "three ordinary PCs of the train-centered beta surface; PC1 is not ATM beta"),
         "missing_data_policy": (
             "use configured Step 4 axes and usable daily ratios, then require "
             "a complete retained surface; no imputation"),
     }
+    if schema.method == "atm_anchored":
+        validation.update(anchor_atm_loading=float(components[0, anchor_index]),
+                          anchor_shape_loading_1=float(components[1, anchor_index]),
+                          anchor_shape_loading_2=float(components[2, anchor_index]))
+    # Fixed, evenly spaced training dates; never choose examples by test performance.
+    example_indices = np.unique(np.linspace(0, split - 1, min(5, split), dtype=int))
+    examples = pd.concat([
+        axes.assign(observation_date=matrix.index[i], actual_beta=values[i],
+                    factor_intercept=factor_intercept,
+                    reconstructed_beta_1factor=reconstructions[0][i],
+                    reconstructed_beta_2factor=reconstructions[1][i],
+                    reconstructed_beta=reconstructions[-1][i],
+                    atm_beta_observed=atm_beta[i]) for i in example_indices], ignore_index=True)
     return Step4Result(
         config, explained, loadings, scores, reconstruction_by_cell,
-        date_coverage, validation)
+        date_coverage, validation, examples)
 
 
 def _save_plots(result: Step4Result, target: Path) -> list[str]:
@@ -351,6 +373,7 @@ def _save_plots(result: Step4Result, target: Path) -> list[str]:
     except ImportError:
         return []
 
+    schema = schema_for(result.config.step4_factor_method)
     files: list[str] = []
     shown = result.explained_variance
     fig, ax = plt.subplots(figsize=(7, 4))
@@ -365,7 +388,7 @@ def _save_plots(result: Step4Result, target: Path) -> list[str]:
     ax.axhline(0.85, color="grey", linestyle="--", linewidth=1)
     ax.set(xticks=(1, 2, 3), xlabel="number of retained factors",
            ylabel="explained variance / reconstruction R-squared",
-           title="Daily-beta anchored factor reconstruction")
+           title=f"Daily-beta reconstruction ({schema.method})")
     ax.legend(fontsize=8)
     fig.tight_layout()
     name = "explained_variance.png"
@@ -374,8 +397,8 @@ def _save_plots(result: Step4Result, target: Path) -> list[str]:
     files.append(name)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
-    columns = ("atm_beta_loading", "shape_loading_1", "shape_loading_2")
-    titles = ("3M ATM factor", "shape factor 1", "shape factor 2")
+    columns = schema.loadings
+    titles = schema.labels
     for ax, column, title in zip(axes, columns, titles):
         table = result.loadings.pivot(
             index="tenor", columns="level", values=column)
@@ -397,14 +420,34 @@ def _save_plots(result: Step4Result, target: Path) -> list[str]:
     fig, axes = plt.subplots(3, 1, figsize=(9, 7), sharex=True)
     for ax, column, label in zip(
             axes,
-            ("atm_beta_factor", "shape_score_1", "shape_score_2"),
-            ("3M ATM daily beta", "shape score 1", "shape score 2")):
+            schema.scores, schema.labels):
         ax.plot(dates, result.scores[column])
         ax.set_ylabel(label)
     axes[-1].set_xlabel("observation date")
     fig.suptitle("Daily-beta surface factor scores")
     fig.tight_layout()
     name = "factor_scores.png"
+    fig.savefig(target / name, dpi=160)
+    plt.close(fig)
+    files.append(name)
+    tenors = result.surface_examples.tenor.unique()
+    fig, axes = plt.subplots(2, len(tenors), figsize=(3 * len(tenors), 6), squeeze=False)
+    for j, tenor in enumerate(tenors):
+        subset = result.surface_examples[result.surface_examples.tenor.eq(tenor)]
+        for date, group in subset.groupby("observation_date"):
+            group = group.sort_values("level")
+            axes[0, j].plot(group.level, group.actual_beta, label=str(date))
+            atm = float(group.atm_beta_observed.iloc[0])
+            if abs(atm) > 1e-8:
+                axes[1, j].plot(group.level, group.actual_beta / atm)
+        axes[0, j].set_title(f"{12 * tenor:g}M")
+        axes[1, j].set_xlabel("K / spot")
+    axes[0, 0].set_ylabel("Observed beta")
+    axes[1, 0].set_ylabel("Beta / observed reference ATM beta")
+    axes[0, 0].legend(fontsize=6)
+    fig.suptitle("Fixed training-date cross sections (near-zero ATM ratios omitted)")
+    fig.tight_layout()
+    name = "surface_cross_sections.png"
     fig.savefig(target / name, dpi=160)
     plt.close(fig)
     files.append(name)
@@ -424,6 +467,7 @@ def save_step4(result: Step4Result, *, step2_beta_path: str | Path,
     result.reconstruction_by_cell.to_csv(
         target / "reconstruction_by_cell.csv", index=False)
     result.date_coverage.to_csv(target / "date_coverage.csv", index=False)
+    result.surface_examples.to_csv(target / "surface_examples.csv", index=False)
     # Remove superseded rolling-PCA artefacts when replacing an old run.
     (target / "pca_loadings.csv").unlink(missing_ok=True)
     (target / "pc_loadings.png").unlink(missing_ok=True)
@@ -431,6 +475,10 @@ def save_step4(result: Step4Result, *, step2_beta_path: str | Path,
                  "factor_scores.png"):
         (target / plot).unlink(missing_ok=True)
     result.validation["plot_files"] = _save_plots(result, target)
+
+    from .step04_report import save_readable_report
+    result.validation["plot_files"] += save_readable_report(result, target, source)
+    result.validation["readable_report"] = "READ_ME_FIRST_CN.html"
 
     inputs = {
         "step02_beta_daily": str(source),

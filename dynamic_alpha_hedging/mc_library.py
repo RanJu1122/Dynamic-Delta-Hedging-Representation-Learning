@@ -96,7 +96,7 @@ class MCLibrary:
                     "numerical": {key: getattr(config, key) for key in NUMERICAL_FIELDS},
                     "tenors": list(self.tenors), "levels": list(self.levels),
                     "alphas": list(config.step3_alphas),
-                    "beta_policy": "raw_minus_same_date_alpha_one; raw MC delta unchanged"}
+                    "beta_policy": "valid_unclipped_beta_minus_same_date_alpha_one; paired_delta_and_leg_price_controls"}
         if path.exists():
             self.metadata = json.loads(path.read_text())
             for key in ("schema", "engine", "numerical", "beta_policy"):

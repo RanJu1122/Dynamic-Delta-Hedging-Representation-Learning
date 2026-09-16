@@ -24,6 +24,7 @@ from sklearn.preprocessing import StandardScaler
 from .artifacts import file_sha256, write_manifest
 from .config import DynamicAlphaConfig
 from .grid import validate_cells
+from .factors import schema_for, validate_factor_pair, copy_metadata, metadata_value
 
 
 FACTOR_COLUMNS = ("atm_beta_factor", "shape_score_1", "shape_score_2")
@@ -140,7 +141,8 @@ def _all_consecutive(flag: pd.Series, window: int) -> pd.Series:
 
 def _build_factor_state_panel(factors: pd.DataFrame, iv_state: pd.DataFrame,
                               changes: pd.DataFrame) -> pd.DataFrame:
-    required_factors = {"observation_date", *DIAGNOSTIC_FACTOR_COLUMNS}
+    schema = schema_for(factors)
+    required_factors = {"observation_date", *schema.scores}
     missing = required_factors.difference(factors.columns)
     if missing:
         raise ValueError(f"Step 4 factor scores miss {sorted(missing)}")
@@ -188,17 +190,17 @@ def _build_factor_state_panel(factors: pd.DataFrame, iv_state: pd.DataFrame,
 
     panel = panel.merge(
         factors, on="observation_date", how="left", validate="one_to_one")
-    panel["factor_available"] = panel[list(FACTOR_COLUMNS)].notna().all(axis=1)
+    panel["factor_available"] = panel[list(schema.scores)].notna().all(axis=1)
     panel["segment"] = (~panel["is_next_business_observation"]).cumsum()
     next_is_observation = (panel["previous_date"].shift(-1).eq(
         panel["observation_date"])
         & panel["is_next_business_observation"].shift(-1, fill_value=False))
-    for factor in FACTOR_COLUMNS:
+    for factor in schema.scores:
         # These are explicit Step 6 labels.  The shift is allowed only when the
         # following row really is the next market observation.
         panel[f"next_{factor}"] = panel[factor].shift(-1).where(
             next_is_observation)
-    return panel
+    return copy_metadata(factors, panel)
 
 
 def _paired_correlation(x: pd.Series, y: pd.Series) -> tuple[int, float, float]:
@@ -240,11 +242,16 @@ def _simple_regression(x: pd.Series, y: pd.Series) -> dict[str, float | int]:
     }
 
 
+def _diagnostic_columns(panel):
+    schema = schema_for(panel)
+    return (*schema.scores, "atm_beta_observed") if schema.method == "pca" else schema.scores
+
+
 def _spot_regressions(panel: pd.DataFrame
                       ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows: list[dict] = []
     with_residuals = panel.copy()
-    for target in DIAGNOSTIC_FACTOR_COLUMNS:
+    for target in _diagnostic_columns(panel):
         masks = {
             "all": panel["dlogS"].notna(),
             "up": panel["dlogS"] > 0.0,
@@ -263,7 +270,7 @@ def _spot_regressions(panel: pd.DataFrame
 
 def _factor_acf(panel: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict] = []
-    for target in DIAGNOSTIC_FACTOR_COLUMNS:
+    for target in _diagnostic_columns(panel):
         series_map = {
             "level": panel[target],
             "first_difference": panel[target].diff(),
@@ -293,7 +300,7 @@ def _next_observation_mask(panel: pd.DataFrame) -> pd.Series:
 def _state_correlations(panel: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict] = []
     next_is_observation = _next_observation_mask(panel)
-    for target in FACTOR_COLUMNS:
+    for target in _diagnostic_columns(panel):
         for feature in STATE_FEATURES:
             n, pearson, spearman = _paired_correlation(
                 panel[feature], panel[target])
@@ -538,10 +545,8 @@ def _daily_prediction_summary(predictions: pd.DataFrame) -> pd.DataFrame:
 
 def _attribution_baseline(factors: pd.DataFrame, loadings: pd.DataFrame,
                           changes: pd.DataFrame) -> pd.DataFrame:
-    required_loadings = {
-        "tenor", "level", "factor_intercept", "atm_beta_loading",
-        "shape_loading_1", "shape_loading_2",
-    }
+    schema = schema_for(loadings)
+    required_loadings = {"tenor", "level", "factor_intercept", *schema.loadings}
     missing = required_loadings.difference(loadings.columns)
     if missing:
         raise ValueError(f"Step 4 factor loadings miss {sorted(missing)}")
@@ -553,9 +558,9 @@ def _attribution_baseline(factors: pd.DataFrame, loadings: pd.DataFrame,
     if missing:
         raise ValueError(f"Step 1 changes miss {sorted(missing)}")
 
-    prior = factors[["observation_date", *FACTOR_COLUMNS]].rename(columns={
+    prior = factors[["observation_date", *schema.scores]].rename(columns={
         "observation_date": "previous_date",
-        **{factor: f"previous_{factor}" for factor in FACTOR_COLUMNS},
+        **{factor: f"previous_{factor}" for factor in schema.scores},
     })
     data = changes.copy()
     data["is_next_business_observation"] = _as_bool(
@@ -565,10 +570,7 @@ def _attribution_baseline(factors: pd.DataFrame, loadings: pd.DataFrame,
     loading_keys = loadings.copy()
     loading_keys["tenor_key"] = loading_keys["tenor"].astype(float).round(12)
     loading_keys["level_key"] = loading_keys["level"].astype(float).round(12)
-    loading_columns = [
-        "tenor_key", "level_key", "factor_intercept", "atm_beta_loading",
-        "shape_loading_1", "shape_loading_2",
-    ]
+    loading_columns = ["tenor_key", "level_key", "factor_intercept", *schema.loadings]
     data = data.merge(prior, on="previous_date", how="inner", validate="many_to_one")
     data = data.merge(
         loading_keys[loading_columns], on=["tenor_key", "level_key"],
@@ -576,11 +578,9 @@ def _attribution_baseline(factors: pd.DataFrame, loadings: pd.DataFrame,
     data = data[
         data["is_next_business_observation"]
         & data[["dIV_surface", "dlogS"]].notna().all(axis=1)].copy()
-    data["beta_hat_previous"] = (
-        data["factor_intercept"]
-        + data["previous_atm_beta_factor"] * data["atm_beta_loading"]
-        + data["previous_shape_score_1"] * data["shape_loading_1"]
-        + data["previous_shape_score_2"] * data["shape_loading_2"])
+    data["beta_hat_previous"] = data["factor_intercept"].to_numpy() + np.sum(
+        data[[f"previous_{f}" for f in schema.scores]].to_numpy()
+        * data[list(schema.loadings)].to_numpy(), axis=1)
     data["sticky_strike_residual"] = data["dIV_surface"]
     data["factor_beta_residual"] = (
         data["dIV_surface"] + data["beta_hat_previous"] * data["dlogS"])
@@ -620,6 +620,7 @@ def run_step5(factors: pd.DataFrame, loadings: pd.DataFrame,
     validate_cells(loadings, config.step4_tenors, config.step4_strike_levels,
                    source="Step 4 loadings")
     validate_cells(daily_beta, config.tenors, config.strike_levels, source="Step 2 beta")
+    schema = validate_factor_pair(factors, loadings, config)
     panel = _build_factor_state_panel(factors, iv_state, changes)
     spot_regression, panel = _spot_regressions(panel)
     factor_acf = _factor_acf(panel)
@@ -641,17 +642,19 @@ def run_step5(factors: pd.DataFrame, loadings: pd.DataFrame,
         primary.loc[primary_model, "beta_oos_r2_vs_training_mean"])
     overall_attribution = attribution[attribution["scope"].eq("overall")].iloc[0]
     acf1 = factor_acf[
-        factor_acf["factor"].eq("atm_beta_factor")
+        factor_acf["factor"].eq("atm_beta_observed" if schema.method == "pca" else "atm_beta_factor")
         & factor_acf["transform"].eq("level")
         & factor_acf["lag"].eq(1)].iloc[0]
     validation = {
+        "factor_method": schema.method,
+        "factor_basis_id": metadata_value(loadings, "factor_basis_id"),
         "calendar_date_count": len(panel),
         "factor_date_count": int(panel["factor_available"].sum()),
         "next_factor_label_count": int(
-            panel[[f"next_{factor}" for factor in FACTOR_COLUMNS]]
+            panel[[f"next_{factor}" for factor in schema.scores]]
             .notna().all(axis=1).sum()),
         "factor_targets_for_step6": tuple(
-            f"next_{factor}" for factor in FACTOR_COLUMNS),
+            f"next_{factor}" for factor in schema.scores),
         "state_feature_count": len(STATE_FEATURES),
         "prediction_feature_count": len(PREDICTION_FEATURES),
         "prediction_target": "next-observation beta_surface_daily",
@@ -672,7 +675,7 @@ def run_step5(factors: pd.DataFrame, loadings: pd.DataFrame,
         "missing_state_policy": (
             "Ridge uses train-only median imputation plus missing indicators; "
             "HistGradientBoosting uses native missing-value splits"),
-        "atm_beta_factor_acf_lag1": float(acf1["autocorrelation"]),
+        "observed_atm_beta_acf_lag1": float(acf1["autocorrelation"]),
         "primary_state_model": primary_model,
         "primary_state_beta_oos_r2_vs_training_mean": primary_beta_r2,
         "primary_state_dIV_rmse": primary_div_rmse,
@@ -695,6 +698,8 @@ def run_step5(factors: pd.DataFrame, loadings: pd.DataFrame,
             "training sample; current per-cell forecasts remain the Step 6 "
             "benchmark for later 1/2/3-factor forecast comparisons"),
     }
+    if schema.method == "atm_anchored":
+        validation["atm_beta_factor_acf_lag1"] = float(acf1["autocorrelation"])
     return Step5Result(
         config, panel, factor_acf, spot_regression, state_correlations,
         predictions, model_summary, prediction_splits, attribution, validation)
@@ -713,21 +718,19 @@ def _save_plot(result: Step5Result, target: Path) -> list[str]:
         result.factor_acf["transform"].eq("level")]
     fig, axes = plt.subplots(2, 2, figsize=(11, 7))
     dates = pd.to_datetime(available["observation_date"])
-    axes[0, 0].plot(dates, available["atm_beta_factor"], label="ATM beta")
-    axes[0, 0].plot(dates, available["shape_score_1"], alpha=0.65,
-                    label="shape 1")
-    axes[0, 0].plot(dates, available["shape_score_2"], alpha=0.65,
-                    label="shape 2")
+    schema = schema_for(result.config.step4_factor_method)
+    for column, label in zip(schema.scores, schema.labels):
+        axes[0, 0].plot(dates, available[column], label=label)
     axes[0, 0].set_title("Step 4 factors")
     axes[0, 0].legend(fontsize=8)
 
     axes[0, 1].scatter(
-        available["dlogS"], available["atm_beta_factor"], s=10, alpha=0.5)
+        available["dlogS"], available["atm_beta_observed" if schema.method == "pca" else "atm_beta_factor"], s=10, alpha=0.5)
     axes[0, 1].set(
-        xlabel="same-close dlogS", ylabel="3M ATM beta factor",
+        xlabel="same-close dlogS", ylabel="Observed reference ATM beta",
         title="Contemporaneous spot relationship")
 
-    for factor in FACTOR_COLUMNS:
+    for factor in schema.scores:
         selected = acf[acf["factor"].eq(factor)]
         axes[1, 0].plot(selected["lag"], selected["autocorrelation"],
                         marker="o", label=factor)

@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 
 from svi_localvol.blackscholes import bs_price_w, bs_vega, implied_total_variance
-from svi_localvol.montecarlo import LocalVolGrid, _estimator_samples, _mean_stderr
+from svi_localvol.montecarlo import (
+    LocalVolGrid, _mean_stderr, _control_coefficient, _validate_beta_inversion)
 from .bump import SpotBumpPolicy
 from .artifacts import file_sha256
 from .data_loader import date_at_tau
@@ -177,16 +178,16 @@ def _controlled_prices(surface, expiry, strike, states, brownian, config):
         lv = df*np.maximum(sign*(terminal-strike), 0)
         cv = df*np.maximum(sign*(terminal_cv-strike), 0)
         exact = np.asarray(bs_price_w(starts*carry, strike, w, df, is_call))
-        obs = lambda x: _estimator_samples(x, config.step3_antithetic)
         def coefficient(a, b):
-            a, b = obs(a), obs(b)
-            var = b.var(ddof=1)
-            return float(np.cov(a, b, ddof=1)[0, 1]/var) if var > 0 else 0.
+            return _control_coefficient(a, b, config.step3_antithetic)
         c = coefficient(lv[1]-lv[2], cv[1]-cv[2])
-        adjusted = lv-c*(cv-exact[:, None])
-        adjusted[0] = lv[0]-coefficient(lv[0], cv[0])*(cv[0]-exact[0])
+        delta_adjusted = lv[1:]-c*(cv[1:]-exact[1:, None])
+        coefficients = np.array([coefficient(x, y) for x, y in zip(lv, cv)])
+        adjusted = lv-coefficients[:, None]*(cv-exact[:, None])
         pv, se = np.array([_mean_stderr(x, config.step3_antithetic) for x in adjusted]).T
-        delta, delta_se = _mean_stderr((adjusted[1]-adjusted[2])/(2*spot*frac),
+        delta_pv = np.array([_mean_stderr(x, config.step3_antithetic)[0]
+                             for x in delta_adjusted])
+        delta, delta_se = _mean_stderr((delta_adjusted[0]-delta_adjusted[1])/(2*spot*frac),
                                       config.step3_antithetic)
         iv, vegas, clipped = [], [], False
         for leg in (1, 2):
@@ -205,15 +206,23 @@ def _controlled_prices(surface, expiry, strike, states, brownian, config):
                    if min(vegas) > 0 else np.nan)
         if not is_call:  # All exported PVs and deltas are CALL values.
             pv += df*(starts*carry-strike)
+            delta_pv += df*(starts[1:]*carry-strike)
             delta += df*carry
         candidates.append({"mc_pv": pv[0], "mc_pv_up": pv[1], "mc_pv_down": pv[2],
                            "mc_pv_stderr": se[0], "delta": delta, "delta_stderr": delta_se,
+                           "mc_pv_up_stderr": se[1], "mc_pv_down_stderr": se[2],
+                           "mc_delta_pv_up": delta_pv[0], "mc_delta_pv_down": delta_pv[1],
+                           "delta_control_beta": c,
+                           "price_control_beta_base": coefficients[0],
+                           "price_control_beta_up": coefficients[1],
+                           "price_control_beta_down": coefficients[2],
                            "beta_model": -(iv[0]-iv[1])/dlog, "beta_model_stderr": beta_se,
                            "price_clipped_for_inversion": bool(clipped),
                            "iv_estimator": "call" if is_call else "put"})
-    return min(candidates, key=lambda r: (r["price_clipped_for_inversion"],
+    chosen = min(candidates, key=lambda r: (r["price_clipped_for_inversion"],
                not np.isfinite(r["beta_model_stderr"]),
                r["beta_model_stderr"] if np.isfinite(r["beta_model_stderr"]) else np.inf))
+    return _validate_beta_inversion(chosen)
 
 
 class SharedSRPricer:

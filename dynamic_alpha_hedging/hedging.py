@@ -170,6 +170,9 @@ def invert_beta(curve, beta):
     """Return alpha, clipped, fallback; preserve measured shape without projection."""
     if curve.empty or not np.isfinite(beta):
         return 1.0, False, True
+    if ("price_clipped_for_inversion" in curve
+            and curve.price_clipped_for_inversion.any()):
+        return 1.0, False, True
     curve = curve.sort_values("alpha")
     b = curve["beta_converter" if "beta_converter" in curve else "beta"].to_numpy(float)
     a = curve.alpha.to_numpy(float)

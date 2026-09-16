@@ -29,4 +29,7 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Keep maintained Markdown visible; original documents remain local.
+docs/source/
+docs/references/
 docs/

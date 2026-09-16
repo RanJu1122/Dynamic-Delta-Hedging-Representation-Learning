@@ -134,7 +134,8 @@ def _cell_quality(curve: pd.DataFrame,
         max_clipped = float(ordered["grid_clipped_fraction"].max())
 
         checks = {
-            "raw_beta_strictly_decreasing": bool(np.all(np.diff(beta) < 0.0)),
+            "raw_beta_strictly_decreasing": bool(
+                np.isfinite(beta).all() and np.all(np.diff(beta) < 0.0)),
             "alpha_one_abs_pass": bool(
                 abs(float(alpha_one["beta_model"]))
                 <= config.step3_alpha_one_abs_tolerance),
@@ -149,7 +150,8 @@ def _cell_quality(curve: pd.DataFrame,
                 and max_clipped <= config.step3_max_grid_clipped_fraction),
         }
         failed = [name for name, passed in checks.items() if not passed]
-        inverse_available = checks["raw_beta_strictly_decreasing"]
+        inverse_available = (checks["raw_beta_strictly_decreasing"]
+                             and checks["price_inversion_pass"])
         rows.append({
             "calibration_date": ordered["calibration_date"].iloc[0],
             "tenor": float(tenor),
@@ -165,9 +167,8 @@ def _cell_quality(curve: pd.DataFrame,
             "max_grid_clipped_fraction": max_clipped,
             **checks,
             "quality_pass": not failed,
-            # This is a mathematical requirement, not a quality threshold:
-            # a non-monotone sampled curve has no unique piecewise-linear
-            # beta -> alpha inverse.  Its raw curve is still retained.
+            # Require a finite monotone curve and no clipped IV inputs.
+            # Other quality thresholds remain diagnostic; raw rows are retained.
             "inverse_available": inverse_available,
             "quality_failures": ";".join(failed),
         })
@@ -370,6 +371,9 @@ _CURVE_COLUMNS = [
     "alpha", "option_type", "spot_up", "spot_down", "dlogS_bump",
     "base_implied_vol", "implied_vol_up", "implied_vol_down", "dIV_model",
     "beta_model", "beta_model_stderr", "beta_alpha_one_raw",
+    "beta_model_unchecked", "beta_model_stderr_unchecked", "beta_inversion_valid",
+    "delta_control_beta", "price_control_beta_up", "price_control_beta_down",
+    "delta_pv_up", "delta_pv_down", "call_delta", "call_delta_stderr",
     "beta_converter", "pv_up", "pv_down", "pv_up_stderr", "pv_down_stderr",
     "price_clipped_for_inversion", "grid_undefined_fraction",
     "grid_clipped_fraction", "n_paths", "n_steps", "quality_pass",

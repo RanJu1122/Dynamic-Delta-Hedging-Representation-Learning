@@ -14,6 +14,7 @@ def _config(args) -> DynamicAlphaConfig:
     fast = bool(getattr(args, "fast", False))
     return DynamicAlphaConfig(
         data_path=getattr(args, "data", DEFAULT_DATA_PATH),
+        step4_factor_method=getattr(args, "factor_method", None) or "atm_anchored",
         beta_clamp=getattr(args, "beta_clamp", 0.0),
         source_timezone=getattr(args, "source_timezone", "Asia/Shanghai"),
         market_timezone=getattr(args, "market_timezone", "America/New_York"),
@@ -39,6 +40,28 @@ def _config(args) -> DynamicAlphaConfig:
         step3_max_beta_stderr=getattr(
             args, "max_beta_stderr", defaults.step3_max_beta_stderr),
     )
+
+
+def _factor_config(args, config):
+    """Infer downstream method from the upstream manifest; explicit conflicts fail."""
+    from dataclasses import replace
+    from .artifacts import read_manifest
+    command = args.command
+    if command == "step5":
+        manifest_path = args.factors.parent / "manifest.json"
+    elif command == "step6":
+        manifest_path = args.panel.parent / "manifest.json"
+    elif command in ("step7", "step7-fixed", "step7-sr", "step7-legacy"):
+        manifest_path = args.input_root / "step06/manifest.json"
+    else:
+        return config
+    if not manifest_path.exists():
+        return config
+    stored = read_manifest(manifest_path)["config"].get("step4_factor_method", "atm_anchored")
+    explicit = getattr(args, "factor_method", None)
+    if explicit is not None and explicit != stored:
+        raise ValueError("factor method conflicts with upstream manifest")
+    return replace(config, step4_factor_method=stored)
 
 
 def _add_date_arguments(parser: argparse.ArgumentParser) -> None:
@@ -101,7 +124,7 @@ def cli() -> None:
     _add_date_arguments(step3)
 
     step4 = commands.add_parser(
-        "step4", help="fit ATM plus two shape factors to daily beta surfaces")
+        "step4", help="fit ATM-anchored factors or ordinary PCA to daily beta surfaces")
     step4.add_argument("--input", type=Path, default=Path(
         "output/dynamic_alpha/step02/beta_daily.csv"))
     step4.add_argument("--output", type=Path,
@@ -206,6 +229,8 @@ def cli() -> None:
         shared.add_argument("--mc-library", type=Path, required=True, help="read-only beta-alpha converters")
         shared.add_argument("--mc-cache", type=Path, help="new SR pricing cache, separate from old precompute")
         shared.add_argument("--book", choices=(("full",) if command == "step7-fixed" else ("atm", "near_atm", "full")), default="full")
+        shared.add_argument("--factor-method", choices=("atm_anchored", "pca"),
+                            help="infer from upstream manifest unless explicitly specified")
         shared.add_argument("--factors", type=int, choices=(1, 2, 3), default=3)
         shared.add_argument("--model", choices=("hist_gradient_boosting", "ridge", "training_mean"),
                             default="hist_gradient_boosting")
@@ -248,6 +273,8 @@ def cli() -> None:
                                 help="aging contracts outside quoted tenors: audited flat boundary IV or fail")
 
     for stage_parser in (step4, step5, step6, step7):
+        stage_parser.add_argument("--factor-method", choices=("atm_anchored", "pca"),
+                                  help="Step 4 defaults to atm_anchored; later stages infer from upstream")
         stage_parser.add_argument("--surface-grid", choices=("legacy56", "full63"), default="full63",
                                   help="default full63: 7 tenors x 9 levels; legacy56 must be selected explicitly")
 
@@ -259,6 +286,7 @@ def cli() -> None:
                             ("paths", "substeps", "spot_bump_fraction", "ratio_nodes")):
             parser.error("--mc-library uses frozen numerical settings; do not pass MC overrides or --fast")
     config = _config(args)
+    config = _factor_config(args, config)
 
     if args.command in ("step7-sr", "step7-fixed"):
         from dataclasses import replace
@@ -407,6 +435,7 @@ def cli() -> None:
               f"{result.validation['input_date_count']}")
         print(f"  beta cells per surface: "
               f"{result.validation['surface_cell_count']}")
+        print(f"  factor method: {config.step4_factor_method}")
         print("  target: beta_surface_daily")
         print("  train/test dates: "
               f"{result.validation['train_date_count']}/"
@@ -419,6 +448,8 @@ def cli() -> None:
               f"{result.validation['one_factor_test_reconstruction_r_squared']:.2%} / "
               f"{result.validation['two_factor_test_reconstruction_r_squared']:.2%} / "
               f"{result.validation['three_factor_test_reconstruction_r_squared']:.2%}")
+        print(f"  中文解读（先看）: {args.output / 'READ_ME_FIRST_CN.html'}")
+        print("  提醒：以上是当天曲面重构，不是明日Beta预测成绩。")
         print(f"  manifest: {manifest}")
         return
 
@@ -472,12 +503,10 @@ def cli() -> None:
         print("  train/test labels: "
               f"{result.validation['train_label_count']}/"
               f"{result.validation['test_label_count']}")
-        print("  ATM factor OOS R2 / correlation: "
-              f"{result.validation['atm_factor_oos_r_squared']:.2%} / "
-              f"{result.validation['atm_factor_correlation']:.3f}")
-        print("  shape-factor OOS R2 (1/2): "
-              f"{result.validation['shape_1_oos_r_squared']:.2%} / "
-              f"{result.validation['shape_2_oos_r_squared']:.2%}")
+        print(f"  factor method: {config.step4_factor_method}")
+        for factor, r2 in result.validation["factor_oos_r_squared"].items():
+            print(f"  {factor}: OOS R2={r2:.2%}, correlation="
+                  f"{result.validation['factor_correlation'][factor]:.3f}")
         print("  surface dIV improvement vs last observed factor (1/2/3 factors): "
               f"{result.validation['one_factor_dIV_improvement_vs_last_factor']:.2%} / "
               f"{result.validation['two_factor_dIV_improvement_vs_last_factor']:.2%} / "

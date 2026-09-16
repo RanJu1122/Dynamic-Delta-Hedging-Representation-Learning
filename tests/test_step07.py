@@ -161,7 +161,7 @@ def test_features_do_not_need_next_label_and_fill_only_from_past():
     assert len(result) == 3
 
 
-def test_joint_mc_delta_is_same_bumped_pv_and_cache_is_reused():
+def test_joint_mc_delta_uses_paired_prices_and_cache_is_reused():
     surface = VolSurface(TEST_MARKET, VolQuoteSet.from_dict(TEST_VOL_PARAMS))
     config = replace(DynamicAlphaConfig(), step3_n_paths=300,
                      step3_n_ratio=51, step3_n_substeps=1)
@@ -169,7 +169,7 @@ def test_joint_mc_delta_is_same_bumped_pv_and_cache_is_reused():
         store = MCMapStore(config, (.25,), (.9, 1., 1.1), directory)
         curve = store.get(surface)
         carry_discount = np.exp(-.03*surface.tau_r(date_at_tau(surface, .25)))
-        expected = (curve.pv_up-curve.pv_down)/(curve.spot_up-curve.spot_down)
+        expected = (curve.delta_pv_up-curve.delta_pv_down)/(curve.spot_up-curve.spot_down)
         expected += np.where(curve.option_type.eq("put"), carry_discount, 0.)
         assert np.allclose(curve.call_delta, expected, rtol=1e-10, atol=1e-10)
         assert np.isfinite(curve.call_delta_stderr).all()

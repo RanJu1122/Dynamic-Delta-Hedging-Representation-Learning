@@ -16,6 +16,7 @@ from .mc_library import MCLibrary
 from .precompute import _csv, _writer_lock
 from .sr_pricing import AlphaSurface, SharedSRPricer, SR_KINDS
 from .step06 import FACTOR_COLUMNS, LAST_FACTOR_COLUMNS
+from .factors import schema_for
 from .step07 import _intervals, _marks, cash_account, hedge_error, _paired_improvement_ci
 
 
@@ -38,9 +39,17 @@ class SharedStep7Config:
 
 
 def _forecast_nodes(inputs, date, columns=FACTOR_COLUMNS):
+    schema = schema_for(inputs.loadings)
+    # Retain the legacy argument as a persistence selector for existing callers.
+    if tuple(columns) in (LAST_FACTOR_COLUMNS, schema.last):
+        columns = schema.last
+    elif tuple(columns) in (FACTOR_COLUMNS, schema.scores):
+        columns = schema.scores
+    else:
+        raise ValueError("forecast columns do not match the selected factor schema")
     z = inputs.forecasts.loc[date, list(columns)].to_numpy(float)
     count = inputs.settings.factor_count
-    columns = ["atm_beta_loading", "shape_loading_1", "shape_loading_2"][:count]
+    columns = list(schema.loadings[:count])
     values = (inputs.loadings.factor_intercept.to_numpy(float)
               + inputs.loadings[columns].to_numpy(float) @ z[:count])
     if not np.isfinite(values).all():

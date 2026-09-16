@@ -96,7 +96,7 @@ def test_new_constant_sr_matches_legacy_mc_and_cache_is_parameter_specific(tmp_p
         new = result[np.isclose(result.tenor, tenor)].sort_values("level")
         assert np.allclose(new.delta, legacy.call_delta, atol=1e-10)
         assert np.allclose(new.beta_model, legacy.beta_model, atol=1e-9)
-    assert np.allclose((result.mc_pv_up-result.mc_pv_down)/.02, result.delta)
+    assert np.allclose((result.mc_delta_pv_up-result.mc_delta_pv_down)/.02, result.delta)
     with patch.object(pricer, "measure", side_effect=AssertionError("cache miss")):
         again = pricer.get(surface, marks, profile)
     assert np.allclose(result.delta, again.delta)

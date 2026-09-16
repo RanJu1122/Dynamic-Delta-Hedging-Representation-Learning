@@ -138,7 +138,7 @@ def test_mixed_expiry_bumps_match_separate_mc_and_separate_cache_identity(tmp_pa
         single = uniform.measure(surface, marks.iloc[[i]], profile).iloc[0]
         for col in ("delta", "beta_model", "mc_pv", "mc_pv_up", "mc_pv_down", "delta_stderr"):
             assert np.isclose(result.iloc[i][col], single[col], atol=1e-10)
-    assert np.allclose(result.delta, (result.mc_pv_up-result.mc_pv_down)/
+    assert np.allclose(result.delta, (result.mc_delta_pv_up-result.mc_delta_pv_down)/
                        (2*surface.ref_spot*result.spot_bump_fraction))
     uniform = SharedSRPricer(config, tmp_path)
     uniform.get(surface, marks, profile)

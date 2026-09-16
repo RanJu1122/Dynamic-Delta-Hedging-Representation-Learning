@@ -76,6 +76,33 @@ def _mean_stderr(x: np.ndarray, antithetic: bool) -> tuple[float, float]:
     return mean, stderr
 
 
+def _control_coefficient(target, control, antithetic):
+    """Fit to the actual estimator observations, including antithetic pairs."""
+    x = _estimator_samples(target, antithetic)
+    y = _estimator_samples(control, antithetic)
+    if x.size < 2:
+        return 0.0
+    variance = float(y.var(ddof=1))
+    return float(np.cov(x, y, ddof=1)[0, 1] / variance) if variance > 0 else 0.0
+
+
+def _validate_beta_inversion(row):
+    """Retain boundary diagnostics without exporting clipped IVs as usable Beta.
+
+    Call/put selection happens first, using the unmasked diagnostic errors.
+    Delta remains usable independently of the IV inversion.
+    """
+    row["beta_model_unchecked"] = row["beta_model"]
+    row["beta_model_stderr_unchecked"] = row["beta_model_stderr"]
+    row["beta_inversion_valid"] = bool(
+        not row["price_clipped_for_inversion"]
+        and np.isfinite(row["beta_model"])
+        and np.isfinite(row["beta_model_stderr"]))
+    if not row["beta_inversion_valid"]:
+        row["beta_model"] = row["beta_model_stderr"] = np.nan
+    return row
+
+
 def _conditional_mean_stderr(values: np.ndarray, mask: np.ndarray,
                              antithetic: bool) -> tuple[float, float]:
     """Conditional mean and cluster-robust SE, pairing Z with -Z."""
@@ -738,9 +765,19 @@ class LocalVolMC:
                     float(np.corrcoef(lv_diff_obs, cv_diff_obs)[0, 1])
                     if cv_var > 0.0 and lv_diff_obs.std(ddof=1) > 0.0
                     else np.nan)
-                adjusted_up = payoff_lv_up - control_beta * (
+                delta_adjusted_up = payoff_lv_up - control_beta * (
                     payoff_cv_up - exact_cv_up)
-                adjusted_down = payoff_lv_down - control_beta * (
+                delta_adjusted_down = payoff_lv_down - control_beta * (
+                    payoff_cv_down - exact_cv_down)
+                # IV inversion needs each price level, whereas Delta needs
+                # their paired difference. These objectives need separate fits.
+                up_control = _control_coefficient(
+                    payoff_lv_up, payoff_cv_up, self.antithetic)
+                down_control = _control_coefficient(
+                    payoff_lv_down, payoff_cv_down, self.antithetic)
+                adjusted_up = payoff_lv_up - up_control * (
+                    payoff_cv_up - exact_cv_up)
+                adjusted_down = payoff_lv_down - down_control * (
                     payoff_cv_down - exact_cv_down)
                 pv_up_raw, pv_up_raw_stderr = _mean_stderr(
                     payoff_lv_up, self.antithetic)
@@ -751,7 +788,7 @@ class LocalVolMC:
                 pv_down, pv_down_stderr = _mean_stderr(
                     adjusted_down, self.antithetic)
                 delta, delta_stderr = _mean_stderr(
-                    (adjusted_up - adjusted_down) / (2.0 * bump),
+                    (delta_adjusted_up - delta_adjusted_down) / (2.0 * bump),
                     self.antithetic)
 
                 if is_call:
@@ -807,6 +844,12 @@ class LocalVolMC:
                     "pv_down_raw_stderr": pv_down_raw_stderr,
                     "price_control_beta": control_beta,
                     "price_control_corr": control_corr,
+                    # Historical price_control_beta names the DELTA fit.
+                    "delta_control_beta": control_beta,
+                    "price_control_beta_up": up_control,
+                    "price_control_beta_down": down_control,
+                    "delta_pv_up": _mean_stderr(delta_adjusted_up, self.antithetic)[0],
+                    "delta_pv_down": _mean_stderr(delta_adjusted_down, self.antithetic)[0],
                     "pv_up": pv_up,
                     "pv_down": pv_down,
                     "pv_up_stderr": pv_up_stderr,
@@ -844,7 +887,7 @@ class LocalVolMC:
                 "grid_up_n_clipped": int(grid_up.n_clipped),
                 "grid_down_n_clipped": int(grid_down.n_clipped),
             })
-            rows.append(chosen)
+            rows.append(_validate_beta_inversion(chosen))
         return pd.DataFrame(rows)
 
     def bump_delta_diagnostics(self, strikes: Sequence[float], maturity,

@@ -52,6 +52,7 @@ class DynamicAlphaConfig:
     step4_strike_levels: tuple[float, ...] | None = None
     step4_anchor_tenor: float | None = None
     step4_anchor_level: float | None = None
+    step4_factor_method: str = "atm_anchored"
     step4_train_fraction: float = 0.75
     level_anchor: str = "spot"
     extrapolation: str = "nan"
@@ -119,6 +120,8 @@ class DynamicAlphaConfig:
             raise ValueError("step4_anchor_tenor must be retained in Step 4")
         if self.step4_anchor_level not in self.step4_strike_levels:
             raise ValueError("step4_anchor_level must be retained in Step 4")
+        if self.step4_factor_method not in ("atm_anchored", "pca"):
+            raise ValueError("step4_factor_method must be atm_anchored or pca")
         if not 0.5 <= self.step4_train_fraction < 1.0:
             raise ValueError("step4_train_fraction must lie in [0.5, 1.0)")
         if self.beta_min_abs_dlogS < 0:

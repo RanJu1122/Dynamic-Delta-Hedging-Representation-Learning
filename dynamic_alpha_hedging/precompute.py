@@ -154,8 +154,8 @@ def run_precompute(config, *, outdir, tenors, levels, plot_count=3, plan_only=Fa
         "plot_dates": selected, "requested_plot_count": plot_count, "plots": [],
         "plot_policy": "middle valid snapshots; all-tenor alpha/level slices plus ATM term slice",
         "causality": "each shard uses its own dated quotes only; no beta labels/models",
-        "beta_policy": "raw and alpha-one-centered beta retained; raw MC delta unchanged",
-        "quality_policy": "audit only; completion is not a convergence certificate",
+        "beta_policy": "unclipped finite beta and alpha-one-centered beta; separate paired Delta and leg price controls",
+        "quality_policy": "invalid IV beta masked; other quality thresholds audited; completion is not a convergence certificate",
         "completed_jobs": 0, "reused_jobs": 0, "computed_jobs": 0,
     }
     inputs = {"svi_parameters": str(config.data_path),

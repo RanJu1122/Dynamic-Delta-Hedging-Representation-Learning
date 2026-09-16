@@ -26,6 +26,7 @@ from sklearn.preprocessing import StandardScaler
 from .artifacts import file_sha256, write_manifest
 from .config import DynamicAlphaConfig
 from .grid import validate_cells
+from .factors import schema_for, validate_factor_pair, copy_metadata, metadata_value
 from .step05 import FACTOR_COLUMNS, STATE_FEATURES
 
 
@@ -97,10 +98,10 @@ def _expected_cells(config: DynamicAlphaConfig) -> pd.MultiIndex:
 
 def _ordered_loadings(loadings: pd.DataFrame, config: DynamicAlphaConfig
                       ) -> pd.DataFrame:
-    required = {
-        "tenor", "level", "mean_beta_train", "factor_intercept",
-        "atm_beta_loading", "shape_loading_1", "shape_loading_2",
-    }
+    schema = schema_for(loadings)
+    if schema.method != config.step4_factor_method:
+        raise ValueError("factor method mismatch between loadings and config")
+    required = {"tenor", "level", "mean_beta_train", "factor_intercept", *schema.loadings}
     missing = required.difference(loadings.columns)
     if missing:
         raise ValueError(f"Step 4 factor loadings miss {sorted(missing)}")
@@ -124,7 +125,8 @@ def factor_features(panel: pd.DataFrame) -> pd.DataFrame:
     if "is_next_business_observation" in values:
         from .step05 import _as_bool
         values["segment"] = (~_as_bool(values["is_next_business_observation"])).cumsum()
-    for factor, last in zip(FACTOR_COLUMNS, LAST_FACTOR_COLUMNS):
+    schema = schema_for(panel)
+    for factor, last in zip(schema.scores, schema.last):
         values[last] = (values.groupby("segment")[factor].ffill()
                         if "segment" in values else values[factor].ffill())
     return values.replace([np.inf, -np.inf], np.nan)
@@ -164,6 +166,7 @@ class FactorForecaster:
     train_end: object
     features: tuple[str, ...] = PREDICTION_FEATURES
     training_means: dict = field(default_factory=dict)
+    factor_method: str = "atm_anchored"
 
     def predict(self, features: pd.DataFrame) -> pd.DataFrame:
         """Return close-t signals; do not require a realised t+1 label."""
@@ -177,7 +180,8 @@ class FactorForecaster:
     def naive_predict(self, features):
         """Persistence benchmark; same close-t cutoff and declared missing-value policy."""
         result = features[["observation_date"]].copy()
-        for factor, last in zip(FACTOR_COLUMNS, LAST_FACTOR_COLUMNS):
+        schema = schema_for(self.factor_method)
+        for factor, last in zip(schema.scores, schema.last):
             result[factor] = features[last].fillna(self.training_means[factor])
         return result
 
@@ -186,25 +190,28 @@ def fit_factor_forecaster(panel: pd.DataFrame, loadings: pd.DataFrame,
                           config: DynamicAlphaConfig, *,
                           model_name="hist_gradient_boosting", model_parameters=None
                           ) -> tuple[FactorForecaster, pd.DataFrame]:
+    schema = validate_factor_pair(panel, loadings, config)
+    prediction_features = (*STATE_FEATURES, *schema.last)
     _ordered_loadings(loadings, config)
     sample = _prediction_panel(panel)
     train = sample[sample["label_sample"].eq("train")]
     models = {}
-    for factor in FACTOR_COLUMNS:
+    for factor in schema.scores:
         model = factor_model(model_name, model_parameters)
-        model.fit(train[list(PREDICTION_FEATURES)].to_numpy(float),
+        model.fit(train[list(prediction_features)].to_numpy(float),
                   train[f"next_{factor}"].to_numpy(float))
         models[factor] = model
-    means = {factor: float(train[f"next_{factor}"].mean()) for factor in FACTOR_COLUMNS}
-    return (FactorForecaster(models, train["label_date"].max(), training_means=means),
+    means = {factor: float(train[f"next_{factor}"].mean()) for factor in schema.scores}
+    return (FactorForecaster(models, train["label_date"].max(), features=prediction_features, training_means=means, factor_method=schema.method),
             factor_features(panel))
 
 
 def _prediction_panel(panel: pd.DataFrame) -> pd.DataFrame:
-    next_factors = tuple(f"next_{name}" for name in FACTOR_COLUMNS)
+    schema = schema_for(panel)
+    next_factors = tuple(f"next_{name}" for name in schema.scores)
     required = {
         "observation_date", "previous_date", "sample", "dlogS",
-        *STATE_FEATURES, *FACTOR_COLUMNS, *next_factors,
+        *STATE_FEATURES, *schema.scores, *next_factors,
     }
     missing = required.difference(panel.columns)
     if missing:
@@ -224,7 +231,7 @@ def _prediction_panel(panel: pd.DataFrame) -> pd.DataFrame:
         next_is_observation)
 
     for factor, target, last in zip(
-            FACTOR_COLUMNS, next_factors, LAST_FACTOR_COLUMNS):
+            schema.scores, next_factors, schema.last):
         expected = values[factor].shift(-1).where(next_is_observation)
         check = values[target].notna() | expected.notna()
         if not np.allclose(
@@ -244,15 +251,17 @@ def _prediction_panel(panel: pd.DataFrame) -> pd.DataFrame:
 
 def _fit_models(sample: pd.DataFrame
                 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
+    schema = schema_for(sample)
+    prediction_features = (*STATE_FEATURES, *schema.last)
     train = sample[sample["label_sample"].eq("train")]
     test = sample[sample["label_sample"].eq("test")]
-    x_train = train[list(PREDICTION_FEATURES)].to_numpy(dtype=float)
-    x_test = test[list(PREDICTION_FEATURES)].to_numpy(dtype=float)
+    x_train = train[list(prediction_features)].to_numpy(dtype=float)
+    x_test = test[list(prediction_features)].to_numpy(dtype=float)
     prediction_rows: list[pd.DataFrame] = []
     importance_rows: list[dict] = []
     ridge_alphas: dict[str, float] = {}
 
-    for factor, last_column in zip(FACTOR_COLUMNS, LAST_FACTOR_COLUMNS):
+    for factor, last_column in zip(schema.scores, schema.last):
         target = f"next_{factor}"
         y_train = train[target].to_numpy(dtype=float)
         y_test = test[target].to_numpy(dtype=float)
@@ -300,7 +309,7 @@ def _fit_models(sample: pd.DataFrame
             nonlinear, x_test, y_test, scoring="neg_mean_squared_error",
             n_repeats=10, random_state=20260807)
         for feature, mean, std in zip(
-                PREDICTION_FEATURES, importance.importances_mean,
+                prediction_features, importance.importances_mean,
                 importance.importances_std):
             importance_rows.append({
                 "factor": factor,
@@ -365,6 +374,7 @@ def _actual_surface(daily: pd.DataFrame, dates: pd.Index,
 def _surface_summary(factor_predictions: pd.DataFrame,
                      loadings: pd.DataFrame, daily: pd.DataFrame,
                      config: DynamicAlphaConfig) -> pd.DataFrame:
+    schema = schema_for(loadings)
     one_model = factor_predictions[
         factor_predictions["model"].eq(FACTOR_MODELS[0])]
     date_map = (one_model[["feature_date", "label_date", "label_dlogS"]]
@@ -377,11 +387,7 @@ def _surface_summary(factor_predictions: pd.DataFrame,
 
     intercept = loadings["factor_intercept"].to_numpy(dtype=float)
     means = loadings["mean_beta_train"].to_numpy(dtype=float)
-    factor_loadings = np.vstack([
-        loadings["atm_beta_loading"].to_numpy(dtype=float),
-        loadings["shape_loading_1"].to_numpy(dtype=float),
-        loadings["shape_loading_2"].to_numpy(dtype=float),
-    ])
+    factor_loadings = loadings[list(schema.loadings)].to_numpy(dtype=float).T
     surfaces: dict[tuple[str, int], np.ndarray] = {
         ("sticky_strike", 0): np.zeros_like(actual),
         ("training_mean_surface", 0): np.broadcast_to(means, actual.shape),
@@ -391,7 +397,7 @@ def _surface_summary(factor_predictions: pd.DataFrame,
         scores = selected.pivot(
             index="label_date", columns="factor",
             values="predicted_factor").reindex(
-                index=label_dates, columns=FACTOR_COLUMNS)
+                index=label_dates, columns=schema.scores)
         if scores.isna().any().any():
             raise ValueError(f"incomplete factor predictions for {model}")
         score_values = scores.to_numpy(dtype=float)
@@ -405,7 +411,7 @@ def _surface_summary(factor_predictions: pd.DataFrame,
         (config.step4_anchor_tenor, config.step4_anchor_level)))
     scopes: list[tuple[str, float | None, np.ndarray]] = [
         ("overall", None, np.arange(len(cells))),
-        ("atm_anchor", float(config.step4_anchor_tenor),
+        ("atm_anchor" if schema.method == "atm_anchored" else "atm_reference", float(config.step4_anchor_tenor),
          np.asarray([anchor_index])),
     ]
     tenor_values = cells.get_level_values("tenor").to_numpy(dtype=float)
@@ -467,6 +473,8 @@ def run_step6(factor_state_panel: pd.DataFrame,
               daily_beta: pd.DataFrame,
               config: DynamicAlphaConfig = DynamicAlphaConfig()) -> Step6Result:
     """Forecast the next three factors and compare nested beta surfaces."""
+    schema = validate_factor_pair(factor_state_panel, factor_loadings, config)
+    prediction_features = (*STATE_FEATURES, *schema.last)
     loadings = _ordered_loadings(factor_loadings, config)
     sample = _prediction_panel(factor_state_panel)
     predictions, importance, ridge_alphas = _fit_models(sample)
@@ -481,32 +489,30 @@ def run_step6(factor_state_panel: pd.DataFrame,
         & surface_summary["model"].eq(f"factor_{PRIMARY_MODEL}")]
     primary_surfaces = primary_surfaces.set_index("factor_count")
     validation = {
+        "factor_method": schema.method,
+        "factor_basis_id": metadata_value(loadings, "factor_basis_id"),
         "prediction_definition": "g(state_t) -> factor(t+1)",
         "beta_workflow": "daily_only_v1",
         "primary_benchmark": "last_observed_factor",
         "persistence_policy": "close-t daily factor; last valid within segment if missing; training mean if none",
-        "factor_targets": tuple(f"next_{name}" for name in FACTOR_COLUMNS),
+        "factor_targets": tuple(f"next_{name}" for name in schema.scores),
         "train_label_count": int(sample["label_sample"].eq("train").sum()),
         "test_label_count": int(sample["label_sample"].eq("test").sum()),
         "test_start_date": str(sample.loc[
             sample["label_sample"].eq("test"), "label_date"].min()),
         "test_end_date": str(sample.loc[
             sample["label_sample"].eq("test"), "label_date"].max()),
-        "prediction_features": PREDICTION_FEATURES,
-        "feature_count": len(PREDICTION_FEATURES),
+        "prediction_features": prediction_features,
+        "feature_count": len(prediction_features),
         "feature_cutoff": "close t; label-date variables are evaluation only",
         "label_leakage_columns_in_feature_set": [],
         "split_policy": "reuse Step 4 train/test label assignment; no shuffle",
         "primary_model": PRIMARY_MODEL,
         "ridge_alphas": ridge_alphas,
-        "atm_factor_oos_r_squared": float(primary_factors.loc[
-            "atm_beta_factor", "oos_r_squared_vs_training_mean"]),
-        "atm_factor_correlation": float(primary_factors.loc[
-            "atm_beta_factor", "correlation"]),
-        "shape_1_oos_r_squared": float(primary_factors.loc[
-            "shape_score_1", "oos_r_squared_vs_training_mean"]),
-        "shape_2_oos_r_squared": float(primary_factors.loc[
-            "shape_score_2", "oos_r_squared_vs_training_mean"]),
+        "factor_oos_r_squared": {f: float(primary_factors.loc[f, "oos_r_squared_vs_training_mean"])
+                                 for f in schema.scores},
+        "factor_correlation": {f: float(primary_factors.loc[f, "correlation"])
+                               for f in schema.scores},
         "one_factor_dIV_improvement_vs_last_factor": float(primary_surfaces.loc[
             1, "dIV_rmse_improvement_vs_last_factor"]),
         "two_factor_dIV_improvement_vs_last_factor": float(primary_surfaces.loc[
@@ -520,6 +526,20 @@ def run_step6(factor_state_panel: pd.DataFrame,
         "step7_note": (
             "Beta-to-alpha inversion and delta backtesting remain downstream"),
     }
+    if schema.method == "atm_anchored":
+        validation.update(
+            atm_factor_oos_r_squared=validation["factor_oos_r_squared"]["atm_beta_factor"],
+            atm_factor_correlation=validation["factor_correlation"]["atm_beta_factor"],
+            shape_1_oos_r_squared=validation["factor_oos_r_squared"]["shape_score_1"],
+            shape_2_oos_r_squared=validation["factor_oos_r_squared"]["shape_score_2"])
+    atm_scope = "atm_anchor" if schema.method == "atm_anchored" else "atm_reference"
+    atm_results = surface_summary[surface_summary.scope.eq(atm_scope)
+                                  & surface_summary.model.eq(f"factor_{PRIMARY_MODEL}")]
+    validation["atm_beta_surface_oos_r_squared_by_factor_count"] = {
+        str(int(row.factor_count)): float(row.beta_oos_r_squared_vs_training_mean_surface)
+        for row in atm_results.itertuples()}
+    for frame in (predictions, factor_summary, surface_summary, importance):
+        copy_metadata(loadings, frame)
     return Step6Result(
         config, predictions, factor_summary, surface_summary,
         importance, validation)
@@ -536,7 +556,7 @@ def _save_plots(result: Step6Result, target: Path) -> list[str]:
     primary = result.factor_predictions[
         result.factor_predictions["model"].eq(PRIMARY_MODEL)]
     fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-    for ax, factor in zip(axes, FACTOR_COLUMNS):
+    for ax, factor in zip(axes, schema_for(result.config.step4_factor_method).scores):
         data = primary[primary["factor"].eq(factor)]
         dates = pd.to_datetime(data["label_date"])
         ax.plot(dates, data["actual_factor"], label="actual", linewidth=1)
