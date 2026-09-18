@@ -191,6 +191,31 @@ selection.  Quality checks remain auditable. Clipped/non-finite Beta estimates a
 Generated files live under `output/` and are ignored by Git.  Source data lives
 under `data/`; it is not generated output and is versioned deliberately.
 
+Step 6 can additionally compare CatBoost against Ridge, HGB, the training mean
+and last observed factor. Install the optional dependency with
+`uv pip install '.[catboost]'`, then add `--include-catboost` to the Step 6 command
+with the chosen `--panel`, `--loadings`, `--daily-beta` and `--output` paths.
+All models use the same 13 close-t features and three next-day factor targets.
+CatBoost uses fixed MAE / Ordered boosting / symmetric depth-3 trees, 200
+iterations, learning rate 0.05 and L2 regularization 10; no test-set early stopping.
+`--catboost-params` accepts fixed JSON overrides for iterations, learning rate,
+depth, L2 regularization, random seed and thread count. Predictions, factor and
+nested surface scores, comparison plots and permutation importance include
+CatBoost. The manifest records its effective configuration and package version.
+Step 7 accepts `--model catboost` after that comparison and automatically reuses
+the recorded CatBoost parameters; conflicting overrides fail. Step 6 also accepts
+`--hgb-params` for HGB loss, learning rate, iteration count, leaf count, minimum
+samples per leaf, L2 regularization, maximum depth and random seed. The effective
+HGB configuration is recorded and automatically reused by Step 7; conflicting
+overrides fail when the Step 6 manifest contains those settings. For one more
+complex fixed configuration, use
+`--hgb-params '{"max_iter":400,"max_leaf_nodes":15,"min_samples_leaf":10}'`
+and `--include-catboost --catboost-params '{"iterations":400,"depth":5}'`.
+Save this experiment to a separate output directory to compare with the original
+results. This is a fixed-configuration experiment, not time-series tuning or a
+new independent test set. These comparisons
+screen candidates for hedging evaluation, without automatically selecting a winner.
+
 Start with the [document index and cleanup list](docs/README.md).
 The maintained references are [architecture](docs/ARCHITECTURE.md),
 [calibration](docs/PRICING_CALIBRATION.md), [input contract](docs/DYNAMIC_ALPHA_READINESS.md),

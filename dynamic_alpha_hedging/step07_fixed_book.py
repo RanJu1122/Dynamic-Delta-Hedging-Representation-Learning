@@ -37,6 +37,7 @@ class FixedStep7Config(SharedStep7Config):
     flat_spot_alpha_one: bool = True
     raw_only: bool = False  # Compatibility alias for three raw policies plus controls.
     strategy_set: str = "dynamic"
+    fixed_baseline: str = "train_best"
     bump_policy: SpotBumpPolicy = field(default_factory=SpotBumpPolicy)
 
     @property
@@ -47,10 +48,18 @@ class FixedStep7Config(SharedStep7Config):
     def include_variants(self):
         return not self.raw_only and self.strategy_set == "full"
 
+    @property
+    def select_fixed_on_train(self):
+        return self.include_controls and self.fixed_baseline == "train_best"
+
     def __post_init__(self):
         super().__post_init__()
         if self.strategy_set not in ("dynamic", "raw_controls", "full"):
             raise ValueError("strategy set must be dynamic, raw_controls or full")
+        if self.fixed_baseline not in ("train_best", "alpha_one"):
+            raise ValueError("fixed baseline must be train_best or alpha_one")
+        if self.fixed_baseline == "alpha_one" and not self.include_controls:
+            raise ValueError("alpha_one baseline requires raw_controls or full strategy set")
         for axis in (self.book_tenors, self.book_levels):
             if not len(axis) or not np.isfinite(axis).all() or min(axis) <= 0 or np.any(np.diff(axis) <= 0):
                 raise ValueError("fixed book axes must be finite, positive and increasing")
@@ -86,10 +95,10 @@ def _plan(inputs, options, provider):
         training = training[-options.max_train_dates-1:]
     if options.max_test_dates:
         testing = testing[:options.max_test_dates+1]
-    if (options.include_controls and len(training) < 3) or len(testing) < 2:
+    if (options.select_fixed_on_train and len(training) < 3) or len(testing) < 2:
         raise ValueError("need at least two training intervals and one test interval")
     rejected = []
-    if options.include_controls:
+    if options.select_fixed_on_train:
         # Choose using TRAINING calendar coverage only, never test returns or future test coverage.
         candidates = training[:-2]
         if options.training_start:
@@ -108,7 +117,7 @@ def _plan(inputs, options, provider):
         else:
             raise ValueError(f"no training cohort with observed settlement spots: {rejected}")
     cohorts, intervals, marks, rows = {}, {"train": [], "test": []}, {}, []
-    samples = (("train", training), ("test", testing)) if options.include_controls else (("test", testing),)
+    samples = (("train", training), ("test", testing)) if options.select_fixed_on_train else (("test", testing),)
     for sample, selected in samples:
         cohort = contract_schedule(inputs.history, selected, options.book_tenors, options.book_levels,
                                    inputs.settings.weights, sample, options.renew_expired)
@@ -135,7 +144,7 @@ def _plan(inputs, options, provider):
                     if key not in provider.index:
                         raise FileNotFoundError(f"missing converter shard: {key}")
     plan = pd.DataFrame(rows)
-    if options.include_controls and len(plan[(plan['sample'] == 'train') & ~plan.is_gap]) < 2:
+    if options.select_fixed_on_train and len(plan[(plan['sample'] == 'train') & ~plan.is_gap]) < 2:
         raise ValueError("need at least two ordinary training intervals for fixed-alpha selection")
     if isinstance(provider, MCLibrary) and options.include_variants:
         for date in _warm_dates(inputs, intervals["test"][0][0], options.rolling_alpha_observations):
@@ -146,7 +155,7 @@ def _plan(inputs, options, provider):
     return cohorts, intervals, marks, plan, rejected
 
 
-def _summary(book, nodes):
+def _summary(book, nodes, *, baseline_strategy="best_fixed_train"):
     rows = []
     std = lambda x: float(np.std(x, ddof=1)) if len(x) > 1 else np.nan
     rmse = lambda x: float(np.sqrt(np.mean(np.asarray(x)**2))) if len(x) else np.nan
@@ -161,12 +170,14 @@ def _summary(book, nodes):
         sig = nodes[nodes.strategy == name]
         alpha_changes = sig.sort_values("feature_date").groupby(["tenor", "level"]).alpha.diff().abs()
         raw = daily.raw_hedge_error.to_numpy()
-        def reference_errors(frame):
-            return frame.reindex(daily.label_date).raw_hedge_error.to_numpy()
+        def reference_errors(frame, column="raw_hedge_error"):
+            return frame.reindex(daily.label_date)[column].to_numpy()
         ref_raw = reference_errors(ref)
-        ci = _paired_improvement_ci(raw, ref_raw,
-            segments=group.is_gap.cumsum()[~group.is_gap].to_numpy()) if len(raw) > 1 and not ref.empty else (np.nan, np.nan)
+        primary_ref = one if baseline_strategy == "fixed_1" else ref
+        ci = _paired_improvement_ci(raw, reference_errors(primary_ref),
+            segments=group.is_gap.cumsum()[~group.is_gap].to_numpy()) if len(raw) > 1 and not primary_ref.empty else (np.nan, np.nan)
         row = dict(strategy=name, n_test_intervals=len(group), n_daily_intervals=len(daily),
+            comparison_baseline=baseline_strategy,
             n_gap_intervals=len(gap), raw_mean_error=float(daily.raw_hedge_error.mean()),
             raw_std_error=std(raw), raw_rmse=rmse(raw), net_std_error=std(daily.net_error),
             net_rmse=rmse(daily.net_error), all_interval_raw_std=std(group.raw_hedge_error),
@@ -184,6 +195,9 @@ def _summary(book, nodes):
             total_hedge_notional_turnover=float(group.hedge_notional_turnover.sum()),
             raw_std_improvement_vs_best_fixed=improvement(std(raw), std(ref_raw)),
             raw_std_improvement_vs_alpha_one=improvement(std(raw), std(reference_errors(one))),
+            raw_rmse_improvement_vs_alpha_one=improvement(rmse(raw), rmse(reference_errors(one))),
+            net_std_improvement_vs_alpha_one=improvement(std(daily.net_error), std(reference_errors(one, "net_error"))),
+            net_rmse_improvement_vs_alpha_one=improvement(rmse(daily.net_error), rmse(reference_errors(one, "net_error"))),
             raw_std_improvement_vs_bs=improvement(std(raw), std(reference_errors(bs))),
             improvement_ci_low=ci[0], improvement_ci_high=ci[1],
             mean_alpha_change=float(alpha_changes.mean()),
@@ -399,8 +413,8 @@ def _backtest(inputs, options, intervals, marks, provider, pricer, progress, che
         checkpoint(completed_training_dates=n, active_date=str(date))
     training = pd.DataFrame(train_rows, columns=["feature_date", "label_date", "alpha", "raw_error",
         "is_gap", "n_options", "n_renewed", "delta_fallback_cells"])
-    best = 1.  # Used only as an internal reference unless controls are requested.
-    if options.include_controls:
+    best = 1.  # Also the predetermined EMA initial value when selection is skipped.
+    if options.select_fixed_on_train:
         scores = training[~training.is_gap].groupby("alpha").raw_error.std(ddof=1)
         best = float(scores.idxmin())
         checkpoint(training_best_alpha=best, training_fixed_std=scores.to_dict())
@@ -458,7 +472,8 @@ def _backtest(inputs, options, intervals, marks, provider, pricer, progress, che
                 priced[name] = priced["fixed_1"] if name in forced else pricer.get(surface, frame, policy)
         measured_one = priced["fixed_1"].beta_model.to_numpy()
         if options.include_controls:
-            strategies["best_fixed_train"], priced["best_fixed_train"] = strategies[f"fixed_{best:g}"], priced[f"fixed_{best:g}"]
+            if options.select_fixed_on_train:
+                strategies["best_fixed_train"], priced["best_fixed_train"] = strategies[f"fixed_{best:g}"], priced[f"fixed_{best:g}"]
             strategies["bs_delta"], priced["bs_delta"] = (profile(date, 1.), None, None), None
         else:
             reference = priced["fixed_1"]
@@ -507,7 +522,8 @@ def _backtest(inputs, options, intervals, marks, provider, pricer, progress, che
     frames = dict(option_pnl=pd.concat(option_rows, ignore_index=True), book_pnl=pd.DataFrame(book_rows),
         alpha_nodes=pd.DataFrame(node_rows), mc_audit=pd.DataFrame(audits), quote_sr=pd.DataFrame(quote_rows),
         localvol_diagnostics=localvol_diagnostics, training_fixed=training)
-    frames["summary"] = _summary(frames["book_pnl"], frames["alpha_nodes"])
+    frames["summary"] = _summary(frames["book_pnl"], frames["alpha_nodes"],
+        baseline_strategy="fixed_1" if options.fixed_baseline == "alpha_one" else "best_fixed_train")
     frames["gap_pnl"] = frames["book_pnl"][frames["book_pnl"].is_gap].copy()
     return frames
 
@@ -596,8 +612,13 @@ def run_fixed_step7(inputs, *, outdir, options=FixedStep7Config(), mc_config=Non
                                   "base is Alpha-invariant, bumps use the executed dynamic Alpha"),
             smoothing=("EMA per observed close on stable signal nodes; no reset at gaps" if options.include_variants and options.half_life
                        else "disabled by selected strategy set"),
+            comparison_baseline=("fixed_1" if options.fixed_baseline == "alpha_one"
+                                 else "best_fixed_train" if options.include_controls else None),
+            smoothing_initialization=("training-selected fixed Alpha" if options.select_fixed_on_train
+                                      else "predetermined Alpha=1"),
             training_selection=("same renewal policy as test; earliest settlement-covered start; daily raw std"
-                                if options.include_controls else "skipped: no fixed-control backtests requested"),
+                                if options.select_fixed_on_train else "skipped: predetermined Alpha=1 baseline; all strategies evaluated on test only"
+                                if options.fixed_baseline == "alpha_one" else "skipped: no fixed-control backtests requested"),
             headline_metric="std(book dV - net book delta*dS) on one-business-day intervals",
             all_interval_pnl="includes gaps, expiry cash and terminal marks; no end trades",
             attribution_policy="BS delta + gamma + finite theta + term roll + Vega beta; expiry IV undefined",

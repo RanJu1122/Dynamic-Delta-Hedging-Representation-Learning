@@ -65,6 +65,7 @@ def test_optional_strategy_dispatch_and_explicit_bump_controls():
                                  training_intervals=0, test_intervals=1)}
     for flags, mode, controls, variants in (([], "dynamic", False, False),
             (["--strategy-set", "full"], "full", True, True),
+            (["--strategy-set", "full", "--fixed-baseline", "alpha_one"], "full", True, True),
             (["--strategy-set", "raw_controls"], "raw_controls", True, False),
             (["--raw-only"], "dynamic", True, False)):
         args = ["dynamic-alpha", "step7", "--mc-library", "library", "--prepare",
@@ -75,6 +76,8 @@ def test_optional_strategy_dispatch_and_explicit_bump_controls():
             cli()
         options = runner.call_args.kwargs["options"]
         assert (options.strategy_set, options.include_controls, options.include_variants) == (mode, controls, variants)
+        assert options.fixed_baseline == ("alpha_one" if "--fixed-baseline" in flags else "train_best")
+        assert options.select_fixed_on_train == (controls and options.fixed_baseline == "train_best")
         assert options.bump_policy == SpotBumpPolicy(5, .0025)
         assert runner.call_args.kwargs["mc_config"].step3_n_paths == 2000
 
@@ -107,6 +110,66 @@ def test_dynamic_only_has_no_training_mc_and_same_raw_results_as_full(tmp_path):
     right = full["option_pnl"].query("strategy in @SR_KINDS").set_index(keys).sort_index()
     for column in ("delta", "raw_hedge_error", "effective_beta", "forecast_attribution_residual"):
         assert np.allclose(left[column], right[column], equal_nan=True)
+
+
+def test_full_suite_against_alpha_one_skips_training_mc_and_preserves_controls(tmp_path):
+    from dynamic_alpha_hedging.step07 import _paired_improvement_ci
+    inputs, maps, pricer, options = _fixed_fixture()
+    inputs.settings = replace(inputs.settings, hedge_cost_bps=3.)
+    options = replace(options, fixed_baseline="alpha_one", renew_expired=True)
+    calls = []
+    original = pricer.get
+    def capture(surface, marks, policy):
+        calls.append(surface.market.pricing_date)
+        return original(surface, marks, policy)
+    with patch.object(pricer, "get", side_effect=capture), \
+            patch("dynamic_alpha_hedging.step07_fixed_book._paired_improvement_ci",
+                  wraps=_paired_improvement_ci) as ci:
+        result = run_fixed_step7(inputs, outdir=tmp_path/"alpha_one", options=options,
+            map_store=maps, pricer=pricer, progress=lambda _: None)
+    strategies = {f"fixed_{a:g}" for a in inputs.config.step3_alphas} | {"bs_delta", "rolling_alpha_mean"}
+    strategies |= {kind+suffix for kind in SR_KINDS for suffix in ("", "_ema", "_last_observed_factor")}
+    book, summary = result["book_pnl"], result["summary"].set_index("strategy")
+    assert len(strategies) == 16 and set(book.strategy) == set(summary.index) == strategies
+    assert result["training_fixed"].empty
+    assert min(calls) == inputs.forecaster.train_end
+    assert len(calls) == book.feature_date.nunique()*15
+    assert summary.comparison_baseline.eq("fixed_1").all()
+    assert summary.raw_std_improvement_vs_best_fixed.isna().all()
+    one = book[book.strategy.eq("fixed_1") & ~book.is_gap].sort_values("feature_date")
+    assert len(ci.call_args_list) == len(strategies)
+    for call in ci.call_args_list:
+        np.testing.assert_allclose(call.args[1], one.raw_hedge_error)
+    for name, group in book.groupby("strategy"):
+        daily = group[~group.is_gap].sort_values("feature_date")
+        assert daily.label_date.tolist() == one.label_date.tolist()
+        row = summary.loc[name]
+        assert np.isclose(row.raw_std_improvement_vs_alpha_one,
+                          1-daily.raw_hedge_error.std()/one.raw_hedge_error.std())
+        assert np.isclose(row.net_std_improvement_vs_alpha_one, 1-daily.net_error.std()/one.net_error.std())
+        assert np.isclose(row.net_rmse_improvement_vs_alpha_one,
+                          1-np.sqrt(np.mean(daily.net_error**2)/np.mean(one.net_error**2)))
+    nodes = result["alpha_nodes"]
+    first_date = book.feature_date.min()
+    raw = nodes[nodes.feature_date.eq(first_date) & nodes.strategy.eq("term_sr")].alpha.to_numpy()
+    ema = nodes[nodes.feature_date.eq(first_date) & nodes.strategy.eq("term_sr_ema")].alpha.to_numpy()
+    decay = 2**(-1/options.half_life)
+    np.testing.assert_allclose(ema, decay+(1-decay)*raw)
+    manifest = json.loads((tmp_path/"alpha_one/manifest.json").read_text())
+    validation = manifest["validation"]
+    assert validation["training_intervals"] == validation["planned_training_profiles"] == 0
+    assert validation["comparison_baseline"] == "fixed_1"
+    assert "training_best_alpha" not in validation
+    assert set(pd.read_csv(tmp_path/"alpha_one/plan.csv")["sample"]) == {"test"}
+    # The evaluated fixed controls and raw/persistence strategies must retain their execution.
+    full = run_fixed_step7(inputs, outdir=tmp_path/"train_best", options=replace(options, fixed_baseline="train_best"),
+        map_store=maps, pricer=pricer, progress=lambda _: None)
+    compared = strategies - {kind+"_ema" for kind in SR_KINDS}
+    keys = ["strategy", "feature_date", "contract_id"]
+    left = result["option_pnl"].query("strategy in @compared").set_index(keys).sort_index()
+    right = full["option_pnl"].query("strategy in @compared").set_index(keys).sort_index()
+    for column in ("delta", "raw_hedge_error", "effective_beta"):
+        np.testing.assert_allclose(left[column], right[column], equal_nan=True)
 
 
 def test_expiry_bump_uses_business_days_and_never_increases_explicit_base():

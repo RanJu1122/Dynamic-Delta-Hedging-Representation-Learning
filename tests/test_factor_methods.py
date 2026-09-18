@@ -142,13 +142,20 @@ def test_pca_step5_step6_and_step7_preparation(tmp_path):
                    factor_loadings_path=dirs["step04"]/"factor_loadings.csv",
                    iv_state_path=iv_path, grid_changes_path=changes_path,
                    daily_beta_path=daily_path, outdir=dirs["step05"])
-        six = run_step6(five.factor_state_panel, four.loadings, beta, config)
+        hgb_parameters = {"max_iter": 11, "max_leaf_nodes": 15, "min_samples_leaf": 3}
+        six = run_step6(five.factor_state_panel, four.loadings, beta, config,
+                        hgb_parameters=hgb_parameters)
         save_step6(six, factor_state_panel_path=dirs["step05"]/"factor_state_panel.csv",
                    factor_loadings_path=dirs["step04"]/"factor_loadings.csv",
                    daily_beta_path=daily_path, outdir=dirs["step06"])
         with patch("dynamic_alpha_hedging.step07.load_surface_history", return_value=object()):
             inputs = prepare_step7(config, Step7Config(book="full", factor_count=3), input_root=tmp_path)
     schema = schema_for("pca")
+    for key, value in hgb_parameters.items():
+        assert inputs.settings.model_params[key] == value
+    for factor in schema.scores:
+        rows = six.factor_predictions.query("model == 'hist_gradient_boosting' and factor == @factor")
+        np.testing.assert_allclose(inputs.forecasts.loc[rows.feature_date, factor], rows.predicted_factor)
     assert set(six.factor_predictions.factor) == set(schema.scores)
     assert "atm_factor_oos_r_squared" not in six.validation
     assert "atm_reference" in set(six.surface_model_summary.scope)
@@ -170,7 +177,8 @@ def test_pca_step5_step6_and_step7_preparation(tmp_path):
         panel.loc[panel.observation_date.isin(test_dates), score] *= 100
         panel[f"next_{score}"] = panel[score].shift(-1)
     with threadpool_limits(limits=1):
-        changed, features = fit_factor_forecaster(panel, four.loadings, config)
+        changed, features = fit_factor_forecaster(panel, four.loadings, config,
+                                                  model_parameters=hgb_parameters)
     cutoff = inputs.forecasts.index[0]
     before = features[features.observation_date.eq(cutoff)]
     np.testing.assert_allclose(changed.predict(before)[list(schema.scores)].to_numpy(),

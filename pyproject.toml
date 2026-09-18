@@ -16,6 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+catboost = ["catboost>=1.2.8"]
 plots = ["matplotlib>=3.7"]
 dev = ["pytest>=7.0"]
 

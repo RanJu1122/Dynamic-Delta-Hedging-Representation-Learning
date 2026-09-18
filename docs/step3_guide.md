@@ -1,5 +1,7 @@
 # Dynamic Alpha Step 3
 
+更新：2026-09-15。当前full63与控制变量修复口径。旧单日8期限结果报告已清理，原文压缩留档。
+
 Step 3 用一张固定、calendar-repaired 的代表性 SVI 曲面，正式测量
 `Beta → Alpha` 转换器：
 
@@ -27,19 +29,18 @@ beta_converter(alpha) = beta_model(alpha) - beta_model(1)
 
 这个平移不改变曲线的斜率或单调性。正式版不使用 PAVA、单调投影或任何拟合
 去改造原始曲线。全部原始结果都会保存和绘图，质量检查只作为审计标签。
-只有原始曲线非单调时，因为不存在唯一的分段线性反函数，该单元不写入
-inverse。
+2026-09-15修复后，价格截断或Beta/标准误非有限也会使估计无效；无效Alpha=1锚点会使整条居中曲线不可用。非单调曲线同样不提供唯一反查。详见[MC修复说明](../MC_CONTROL_FIX_CN.md)。
 
 ## 正式默认配置
 
 - Alpha 节点：`0, 0.5, 1, 1.5, 2`；
 - Spot bump：上下各 1%；
-- 100,000 条 antithetic 路径；
+- 40,000 条 antithetic 路径；
 - 每个 Business/260 时间步再分 2 个子步；
 - Local Vol ratio 网格 801 个节点；
 - 所有 Alpha 以及 up/down 使用共同随机数；
 - 使用常波动 GBM 配对控制变量；
-- 期限为 1M、2M、3M、6M、9M、1Y、1.5Y、2Y；
+- 期限为 2M、3M、6M、9M、1Y、1.5Y、2Y；
 - 未指定日期时，选择完整覆盖期限的 robust IV-grid medoid；也可用
   `--calibration-date YYYY-MM-DD` 指定。
 
@@ -58,8 +59,7 @@ inverse。
 
 这些检查共同生成 `quality_pass`，但不会删除曲线或阻止绘图。远翼特别容易因
 vega 很小而不通过；失败是可见的研究结果，不会被代码静默平滑。正式 inverse
-只以 `inverse_available` 标记原始曲线是否严格单调，因为这是反函数存在的数学
-要求，而不是用质量阈值筛选结果。
+以 `inverse_available` 标记当前生产Beta是否有限且严格单调；无效价格反解已隔离。其他质量门槛仍是诊断，反查可用不代表精度达标。
 
 ## 精简后的输出
 

@@ -1,5 +1,7 @@
 # Dynamic-alpha hedging readiness
 
+Updated 2026-09-15: this is the input contract, not a claim of forecast or hedging acceptance. See [current Step7](STEP7_GUIDE_CN.md).
+
 This is the boundary between the completed pricing calibration and
 `docs/source/动态Alpha对冲研究.docx`.  Preflight is a gate, not Dynamic Step 0.
 
@@ -25,7 +27,7 @@ stickiness alpha.
 - Rates are assumptions because the pickle contains no rate/dividend/repo:
   `r=3.6%`, `q=3%`, `repo=0`.
 - Volatility time is Business/260; forward and discount time are Act/365.
-- Descriptive panel tenors are `1M, 2M, 3M, 6M, 9M, 1Y, 1.5Y, 2Y` on
+- Descriptive panel tenors are `2M, 3M, 6M, 9M, 1Y, 1.5Y, 2Y` on
   Business/260.  The added 2M node has near-complete historical coverage and
   resolves the fast short-end beta decay without duplicating the long end.
 - Baseline strike levels follow the document literally: `0.4, 0.5, ..., 1.2`.
@@ -58,7 +60,7 @@ file satisfies that date contract.  Its explicit tolerance policy keeps the firs
 row of a repeated VolDate and records every dropped duplicate in the raw export;
 the small number of still-unbuildable observations are listed and excluded.
 Multi-business-day gaps remain visible in Step 1 but are excluded from the
-daily-beta labels and holding intervals.
+daily-beta labels. The default fixed renewal book carries positions across gaps; legacy segmented intervals follow a different convention.
 
 Run:
 

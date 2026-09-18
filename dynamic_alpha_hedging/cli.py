@@ -148,6 +148,11 @@ def cli() -> None:
                        default=Path("output/dynamic_alpha/step05"))
     step5.add_argument("--min-abs-dlogS", type=float, default=0.0025,
                        help="must match the threshold used for Step 2 input")
+    step5.add_argument("--mc-library", type=Path,
+                       help="read-only repaired MC library for the document's option-PV attribution test")
+    step5.add_argument("--attribution-window", type=int, default=60,
+                       help="past observed transitions used to estimate attribution elasticity")
+    step5.add_argument("--attribution-min-observations", type=int, default=20)
 
     step6 = commands.add_parser(
         "step6", help="forecast next daily-beta factors and beta surfaces")
@@ -161,6 +166,12 @@ def cli() -> None:
                        default=Path("output/dynamic_alpha/step06"))
     step6.add_argument("--min-abs-dlogS", type=float, default=0.0025,
                        help="must match the threshold used for Step 2 input")
+    step6.add_argument("--hgb-params", type=_model_parameters, default={},
+                       help="fixed HGB JSON parameters, e.g. max_iter/max_leaf_nodes/min_samples_leaf")
+    step6.add_argument("--include-catboost", action="store_true",
+                       help="compare CatBoost on the same factor labels and features (requires catboost extra)")
+    step6.add_argument("--catboost-params", type=_model_parameters, default={},
+                       help="fixed CatBoost JSON parameters; requires --include-catboost")
 
     defaults = DynamicAlphaConfig()
     precompute = commands.add_parser("precompute", help="build a reusable date-local MC library")
@@ -202,7 +213,7 @@ def cli() -> None:
     source.add_argument("--mc-library", type=Path, help="read-only pricing library; no MC is started")
     source.add_argument("--mc-cache", type=Path,
                        help="share existing content-validated MC cache across output folders")
-    step7.add_argument("--model", choices=("hist_gradient_boosting", "ridge", "training_mean"),
+    step7.add_argument("--model", choices=("hist_gradient_boosting", "catboost", "ridge", "training_mean"),
                        default="hist_gradient_boosting")
     step7.add_argument("--model-params", type=_model_parameters, default={},
                        help='JSON parameters, e.g. {"max_iter":300} or {"alpha":1.0}')
@@ -232,7 +243,7 @@ def cli() -> None:
         shared.add_argument("--factor-method", choices=("atm_anchored", "pca"),
                             help="infer from upstream manifest unless explicitly specified")
         shared.add_argument("--factors", type=int, choices=(1, 2, 3), default=3)
-        shared.add_argument("--model", choices=("hist_gradient_boosting", "ridge", "training_mean"),
+        shared.add_argument("--model", choices=("hist_gradient_boosting", "catboost", "ridge", "training_mean"),
                             default="hist_gradient_boosting")
         shared.add_argument("--model-params", type=_model_parameters, default={})
         shared.add_argument("--half-life", type=float, default=10.,
@@ -260,6 +271,8 @@ def cli() -> None:
                                    default="dynamic", help="default: only three raw SR strategies; optional controls/full suite")
             selection.add_argument("--raw-only", action="store_true",
                                    help="compatibility alias for --strategy-set raw_controls")
+            shared.add_argument("--fixed-baseline", choices=("train_best", "alpha_one"), default="train_best",
+                                help="alpha_one skips training-period fixed-alpha backtests; test all requested controls against Alpha=1")
             shared.add_argument("--short-bump-days", type=int, default=10,
                                 help="use smaller bump up to this many remaining business days; 0 disables")
             shared.add_argument("--short-bump-fraction", type=float, default=.005,
@@ -301,7 +314,7 @@ def cli() -> None:
                 max_test_dates=args.max_test_dates, training_start=args.training_start,
                 mark_extrapolation=args.mark_extrapolation, renew_expired=args.renew_expired,
                 flat_spot_alpha_one=args.flat_spot_alpha_one, raw_only=args.raw_only,
-                strategy_set=args.strategy_set,
+                strategy_set=args.strategy_set, fixed_baseline=args.fixed_baseline,
                 bump_policy=SpotBumpPolicy(args.short_bump_days, args.short_bump_fraction))
         else:
             runner = run_shared_step7
@@ -326,8 +339,11 @@ def cli() -> None:
             prepare_only=args.prepare, cache_dir=args.mc_cache,
             progress=lambda message: print(message, flush=True))
         if not args.prepare:
+            improvement_column = ("raw_std_improvement_vs_alpha_one"
+                if args.command == "step7-fixed" and args.fixed_baseline == "alpha_one"
+                else "raw_std_improvement_vs_best_fixed")
             print(result["summary"][["strategy", "raw_std_error", "net_std_error",
-                  "raw_std_improvement_vs_best_fixed", "final_wealth"]].to_string(index=False))
+                  improvement_column, "final_wealth"]].to_string(index=False))
         else:
             plan = result["validation"]
             print(f"  training/test intervals: {plan['training_intervals']}/{plan['test_intervals']}; "
@@ -464,7 +480,10 @@ def cli() -> None:
             daily_beta_path=args.daily_beta))
         result = run_step5(
             factors, loadings, iv_state, changes, daily_beta,
-            config)
+            config, mc_library=args.mc_library,
+            attribution_window=args.attribution_window,
+            attribution_min_observations=args.attribution_min_observations,
+            progress=lambda message: print(message, flush=True))
         manifest = save_step5(
             result, factor_scores_path=args.factors,
             factor_loadings_path=args.loadings,
@@ -472,6 +491,8 @@ def cli() -> None:
             daily_beta_path=args.daily_beta,
             outdir=args.output)
         print("Dynamic Alpha Step 5 complete")
+        print(f"  document P&L attribution: {result.validation['pnl_attribution_status']}")
+        print("  predictive model CSVs are an auxiliary experiment for Step 6 review")
         print("  target: next-observation beta_surface_daily")
         print("  usable label dates: "
               f"{result.validation['daily_beta_label_date_count']}")
@@ -492,7 +513,10 @@ def cli() -> None:
             factor_loadings_path=args.loadings,
             daily_beta_path=args.daily_beta)
         result = run_step6(
-            panel, loadings, daily_beta, config)
+            panel, loadings, daily_beta, config,
+            hgb_parameters=args.hgb_params,
+            include_catboost=args.include_catboost,
+            catboost_parameters=args.catboost_params)
         manifest = save_step6(
             result, factor_state_panel_path=args.panel,
             factor_loadings_path=args.loadings,
@@ -504,6 +528,11 @@ def cli() -> None:
               f"{result.validation['train_label_count']}/"
               f"{result.validation['test_label_count']}")
         print(f"  factor method: {config.step4_factor_method}")
+        for model, comparison in result.validation["nonlinear_model_comparison"].items():
+            print(f"  {model} factor OOS R2 vs training mean: "
+                  f"{comparison['factor_oos_r_squared_vs_training_mean']}")
+            print(f"  {model} surface dIV RMSE (1/2/3 factors): "
+                  f"{comparison['surface_dIV_rmse_by_factor_count']}")
         for factor, r2 in result.validation["factor_oos_r_squared"].items():
             print(f"  {factor}: OOS R2={r2:.2%}, correlation="
                   f"{result.validation['factor_correlation'][factor]:.3f}")

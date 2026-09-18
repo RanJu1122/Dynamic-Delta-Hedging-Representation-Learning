@@ -6,7 +6,7 @@ the cash account. Historical marks are SVI marks, not exchange executions.
 """
 
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 from pathlib import Path
 
@@ -23,7 +23,8 @@ from .hedging import (MCMapStore, cell_curve, contract_interval, invert_beta,
                       delta_at_alpha)
 from .hedge_comparison import shadow_delta, mc_consistency, pooled_converter
 from .step06 import (FACTOR_COLUMNS, LAST_FACTOR_COLUMNS, fit_factor_forecaster, load_step6_inputs,
-                     _ordered_loadings, _canonical_axes)
+                     _ordered_loadings, _canonical_axes, catboost_parameters_from_step6,
+                     hgb_parameters_from_step6)
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,12 @@ def prepare_step7(config=DynamicAlphaConfig(), settings=Step7Config(), *,
                              expected_stage="dynamic_alpha_step06")
     if manifest["validation"].get("beta_workflow") != "daily_only_v1":
         raise ValueError("Step 6 uses an obsolete beta workflow; rebuild Steps 2, 4, 5, 6 for daily-only")
+    if settings.model == "catboost":
+        settings = replace(settings, model_params=catboost_parameters_from_step6(
+            manifest["validation"], settings.model_params))
+    elif settings.model == "hist_gradient_boosting":
+        settings = replace(settings, model_params=hgb_parameters_from_step6(
+            manifest["validation"], settings.model_params))
     # Validate the entire recorded chain, not only the final CSVs.
     sources = {}
     for step in ("step01", "step02", "step04", "step05", "step06"):

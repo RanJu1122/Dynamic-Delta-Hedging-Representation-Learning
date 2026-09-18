@@ -56,6 +56,7 @@ class Step5Result:
     prediction_splits: pd.DataFrame
     attribution_baseline: pd.DataFrame
     validation: dict[str, object]
+    pnl_attribution: object | None = None
 
 
 def _read_csv(path: str | Path, date_columns: tuple[str, ...]) -> pd.DataFrame:
@@ -269,22 +270,29 @@ def _spot_regressions(panel: pd.DataFrame
 
 
 def _factor_acf(panel: pd.DataFrame) -> pd.DataFrame:
+    from .step05_diagnostics import correlation_interval
     rows: list[dict] = []
+    segments = panel.get("segment", pd.Series(0, index=panel.index))
     for target in _diagnostic_columns(panel):
         series_map = {
             "level": panel[target],
-            "first_difference": panel[target].diff(),
+            "first_difference": panel[target].groupby(segments).diff(),
             "spot_residual": panel[f"{target}_spot_residual"],
         }
         for transform, series in series_map.items():
             for lag in range(1, 11):
-                n, correlation, _ = _paired_correlation(series, series.shift(lag))
+                same_segment = segments.eq(segments.shift(lag))
+                shifted = series.shift(lag).where(same_segment)
+                n, correlation, _ = _paired_correlation(series, shifted)
+                low, high = correlation_interval(series, shifted, segments)
                 rows.append({
                     "factor": target,
                     "transform": transform,
                     "lag": lag,
                     "n_pairs": n,
                     "autocorrelation": correlation,
+                    "ci_low": low, "ci_high": high,
+                    "lag_policy": "continuous business observations; no cross-segment pair",
                 })
     return pd.DataFrame(rows)
 
@@ -615,7 +623,10 @@ def _attribution_baseline(factors: pd.DataFrame, loadings: pd.DataFrame,
 def run_step5(factors: pd.DataFrame, loadings: pd.DataFrame,
               iv_state: pd.DataFrame, changes: pd.DataFrame,
               daily_beta: pd.DataFrame,
-              config: DynamicAlphaConfig = DynamicAlphaConfig()) -> Step5Result:
+              config: DynamicAlphaConfig = DynamicAlphaConfig(), *,
+              mc_library: str | Path | None = None,
+              attribution_window: int = 60, attribution_min_observations: int = 20,
+              progress=None) -> Step5Result:
     """Test whether close-t state predicts the next realised daily beta."""
     validate_cells(loadings, config.step4_tenors, config.step4_strike_levels,
                    source="Step 4 loadings")
@@ -700,9 +711,23 @@ def run_step5(factors: pd.DataFrame, loadings: pd.DataFrame,
     }
     if schema.method == "atm_anchored":
         validation["atm_beta_factor_acf_lag1"] = float(acf1["autocorrelation"])
-    return Step5Result(
+    result = Step5Result(
         config, panel, factor_acf, spot_regression, state_correlations,
         predictions, model_summary, prediction_splits, attribution, validation)
+    result.validation.update(
+        acf_pair_policy="continuous business-day lag; reject cross-segment pairs; preserve missing labels",
+        acf_ci_policy="1000 paired consecutive-block bootstrap draws; blocks <=10 rows within calendar segments, including short segments; exploratory 95%",
+        diagnostic_sample_policy="full sample exploratory; separate train/test stability tables also saved",
+        legacy_gate_role="optional direct-node forecast experiment; not the document Step5 acceptance rule",
+        legacy_attribution_role="IV-residual proxy with previous factor beta; not the document PV attribution test",
+        pnl_attribution_status="not_requested; pass --mc-library to evaluate historical option PV")
+    if mc_library is not None:
+        from .step05_attribution import run_pnl_attribution
+        result.pnl_attribution = run_pnl_attribution(changes, factors, config, mc_library,
+            window=attribution_window, min_observations=attribution_min_observations, progress=progress)
+        result.validation["pnl_attribution_status"] = "complete"
+        result.validation["pnl_attribution"] = result.pnl_attribution.validation
+    return result
 
 
 def _save_plot(result: Step5Result, target: Path) -> list[str]:
@@ -777,6 +802,20 @@ def save_step5(result: Step5Result, *, factor_scores_path: str | Path,
     (target / "predictability_baselines.csv").unlink(missing_ok=True)
     (target / "factor_diagnostics.png").unlink(missing_ok=True)
     result.validation["plot_files"] = _save_plot(result, target)
+    from .step05_diagnostics import period_statistics, save_diagnostic_plots
+    if "sample" in result.factor_state_panel:
+        acf, correlations, regressions = period_statistics(
+            result.factor_state_panel, _factor_acf, _state_correlations, _spot_regressions)
+        acf.to_csv(target / "factor_acf_by_period.csv", index=False)
+        correlations.to_csv(target / "state_correlations_by_period.csv", index=False)
+        regressions.to_csv(target / "spot_regression_by_period.csv", index=False)
+    result.validation["plot_files"] += save_diagnostic_plots(result, target)
+    if result.pnl_attribution is not None:
+        for name, frame in (("attribution_elasticities", result.pnl_attribution.elasticities),
+                            ("attribution_option_pnl", result.pnl_attribution.option_pnl),
+                            ("attribution_pnl_summary", result.pnl_attribution.summary),
+                            ("attribution_pnl_coverage", result.pnl_attribution.coverage)):
+            frame.to_csv(target / f"{name}.csv", index=False)
 
     input_paths = {
         "step04_factor_scores": Path(factor_scores_path),
@@ -786,6 +825,10 @@ def save_step5(result: Step5Result, *, factor_scores_path: str | Path,
         "step02_daily_beta": Path(daily_beta_path),
     }
     inputs: dict[str, str] = {}
+    if result.pnl_attribution is not None:
+        inputs.update(result.pnl_attribution.inputs)
+    for code in ("step05.py", "step05_diagnostics.py", "step05_attribution.py"):
+        input_paths["implementation_" + code[:-3]] = Path(__file__).with_name(code)
     for name, path in input_paths.items():
         inputs[name] = str(path)
         inputs[f"{name}_sha256"] = file_sha256(path)

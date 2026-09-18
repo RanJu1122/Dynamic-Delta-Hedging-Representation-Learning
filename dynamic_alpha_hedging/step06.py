@@ -37,6 +37,20 @@ FACTOR_MODELS = (
     "ridge_state", "hist_gradient_boosting",
 )
 PRIMARY_MODEL = "hist_gradient_boosting"
+HGB_PARAMETERS = frozenset({
+    "loss", "learning_rate", "max_iter", "max_leaf_nodes", "min_samples_leaf",
+    "l2_regularization", "max_depth", "random_state",
+})
+CATBOOST_DEFAULTS = dict(
+    loss_function="MAE", iterations=200, learning_rate=0.05, depth=3,
+    l2_leaf_reg=10.0, boosting_type="Ordered", grow_policy="SymmetricTree",
+    has_time=True, nan_mode="Min", use_best_model=False,
+    allow_writing_files=False, verbose=False, random_seed=20260807,
+    thread_count=1, task_type="CPU", allow_const_label=True,
+)
+CATBOOST_PARAMETERS = frozenset({
+    "iterations", "learning_rate", "depth", "l2_leaf_reg", "random_seed", "thread_count",
+})
 
 
 @dataclass
@@ -146,18 +160,57 @@ def factor_model(name="hist_gradient_boosting", parameters=None):
     from sklearn.dummy import DummyRegressor
     parameters = dict(parameters or {})
     allowed = {
-        "hist_gradient_boosting": {"loss", "learning_rate", "max_iter",
-            "max_leaf_nodes", "min_samples_leaf", "l2_regularization",
-            "max_depth", "random_state"},
+        "hist_gradient_boosting": HGB_PARAMETERS,
         "ridge": {"alpha"}, "training_mean": set(),
+        "catboost": CATBOOST_PARAMETERS,
     }
     if name not in allowed or set(parameters) - allowed[name]:
         raise ValueError(f"unsupported factor model or parameters: {name}, {sorted(parameters)}")
     if name == "hist_gradient_boosting":
         return primary_factor_model(**parameters)
+    if name == "catboost":
+        try:
+            from catboost import CatBoostRegressor
+        except ImportError as exc:
+            raise ImportError(
+                "CatBoost was requested but is not installed. Install the project "
+                "extra with: pip install '.[catboost]' (or uv pip install '.[catboost]')"
+            ) from exc
+        return CatBoostRegressor(**(CATBOOST_DEFAULTS | parameters))
     estimator = Ridge(**parameters) if name == "ridge" else DummyRegressor(strategy="mean")
     return make_pipeline(SimpleImputer(strategy="median", add_indicator=True,
                                       keep_empty_features=True), StandardScaler(), estimator)
+
+
+def hgb_parameters_from_step6(validation, overrides=None):
+    """Reuse evaluated HGB settings; preserve legacy manifests without settings."""
+    stored = validation.get("nonlinear_model_parameters", {}).get(PRIMARY_MODEL)
+    overrides = dict(overrides or {})
+    if stored is None:
+        factor_model(PRIMARY_MODEL, overrides)
+        return overrides
+    parameters = {key: stored[key] for key in HGB_PARAMETERS if key in stored}
+    effective = factor_model(PRIMARY_MODEL, parameters).get_params()
+    if effective != stored:
+        raise ValueError("Step 6 HGB policy differs from current implementation; rebuild Step 6")
+    if set(overrides) - HGB_PARAMETERS or (effective | overrides) != effective:
+        raise ValueError("Step 7 HGB parameters differ from evaluated Step 6 parameters")
+    return parameters
+
+
+def catboost_parameters_from_step6(validation, overrides=None):
+    """Reuse the evaluated CatBoost configuration when entering Step 7."""
+    stored = validation.get("nonlinear_model_parameters", {}).get("catboost")
+    if stored is None:
+        raise ValueError("CatBoost was not evaluated in Step 6; run step6 --include-catboost first")
+    parameters = {key: stored[key] for key in CATBOOST_PARAMETERS if key in stored}
+    effective = CATBOOST_DEFAULTS | parameters
+    if effective != stored:
+        raise ValueError("Step 6 CatBoost policy differs from current implementation; rebuild Step 6")
+    overrides = dict(overrides or {})
+    if set(overrides) - CATBOOST_PARAMETERS or (effective | overrides) != effective:
+        raise ValueError("Step 7 CatBoost parameters differ from evaluated Step 6 parameters")
+    return parameters
 
 
 @dataclass
@@ -249,8 +302,14 @@ def _prediction_panel(panel: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def _fit_models(sample: pd.DataFrame
+def _fit_models(sample: pd.DataFrame, *, hgb_parameters=None, include_catboost=False,
+                catboost_parameters=None,
                 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
+    factor_model(PRIMARY_MODEL, hgb_parameters)  # Validate controls before fitting.
+    if catboost_parameters and not include_catboost:
+        raise ValueError("catboost_parameters requires include_catboost=True")
+    if include_catboost:
+        factor_model("catboost", catboost_parameters)  # Fail before any fitting.
     schema = schema_for(sample)
     prediction_features = (*STATE_FEATURES, *schema.last)
     train = sample[sample["label_sample"].eq("train")]
@@ -279,9 +338,12 @@ def _fit_models(sample: pd.DataFrame
             cv=TimeSeriesSplit(n_splits=3),
             scoring="neg_mean_absolute_error", n_jobs=-1,
         )
-        nonlinear = primary_factor_model()
+        nonlinear_models = {PRIMARY_MODEL: factor_model(PRIMARY_MODEL, hgb_parameters)}
+        if include_catboost:
+            nonlinear_models["catboost"] = factor_model("catboost", catboost_parameters)
         ridge.fit(x_train, y_train)
-        nonlinear.fit(x_train, y_train)
+        for model in nonlinear_models.values():
+            model.fit(x_train, y_train)
         ridge_alphas[factor] = float(ridge.best_params_["ridge__alpha"])
 
         last_observed = test[last_column].fillna(train_mean).to_numpy(float)
@@ -289,7 +351,7 @@ def _fit_models(sample: pd.DataFrame
             "training_mean": np.full(len(test), train_mean),
             "last_observed_factor": last_observed,
             "ridge_state": ridge.predict(x_test),
-            "hist_gradient_boosting": nonlinear.predict(x_test),
+            **{name: model.predict(x_test) for name, model in nonlinear_models.items()},
         }
         common = test[[
             "observation_date", "label_date", "label_dlogS"]].rename(
@@ -305,19 +367,20 @@ def _fit_models(sample: pd.DataFrame
             output["error"] = y_test - predicted
             prediction_rows.append(output)
 
-        importance = permutation_importance(
-            nonlinear, x_test, y_test, scoring="neg_mean_squared_error",
-            n_repeats=10, random_state=20260807)
-        for feature, mean, std in zip(
-                prediction_features, importance.importances_mean,
-                importance.importances_std):
-            importance_rows.append({
-                "factor": factor,
-                "model": PRIMARY_MODEL,
-                "feature": feature,
-                "importance_mean": float(mean),
-                "importance_std": float(std),
-            })
+        for name, model in nonlinear_models.items():
+            importance = permutation_importance(
+                model, x_test, y_test, scoring="neg_mean_squared_error",
+                n_repeats=10, random_state=20260807)
+            for feature, mean, std in zip(
+                    prediction_features, importance.importances_mean,
+                    importance.importances_std):
+                importance_rows.append({
+                    "factor": factor,
+                    "model": name,
+                    "feature": feature,
+                    "importance_mean": float(mean),
+                    "importance_std": float(std),
+                })
 
     return (pd.concat(prediction_rows, ignore_index=True),
             pd.DataFrame(importance_rows), ridge_alphas)
@@ -392,7 +455,7 @@ def _surface_summary(factor_predictions: pd.DataFrame,
         ("sticky_strike", 0): np.zeros_like(actual),
         ("training_mean_surface", 0): np.broadcast_to(means, actual.shape),
     }
-    for model in FACTOR_MODELS:
+    for model in factor_predictions["model"].unique():
         selected = factor_predictions[factor_predictions["model"].eq(model)]
         scores = selected.pivot(
             index="label_date", columns="factor",
@@ -425,6 +488,8 @@ def _surface_summary(factor_predictions: pd.DataFrame,
         mean_scope = np.broadcast_to(means[indices], actual_scope.shape)
         actual_div = -actual_scope * label_dlogS[:, None]
         sticky_rmse = float(np.sqrt(np.mean(actual_div ** 2)))
+        mean_div_rmse = float(np.sqrt(np.mean(
+            ((actual_scope - mean_scope) * label_dlogS[:, None]) ** 2)))
         baseline_sse = float(np.sum((actual_scope - mean_scope) ** 2))
         for (model, count), predicted in surfaces.items():
             predicted_scope = predicted[:, indices]
@@ -432,6 +497,9 @@ def _surface_summary(factor_predictions: pd.DataFrame,
             naive_scope = surfaces[("factor_last_observed_factor", baseline_count)][:, indices]
             naive_div = -naive_scope * label_dlogS[:, None]
             naive_rmse = float(np.sqrt(np.mean((actual_div-naive_div)**2)))
+            hgb_scope = surfaces[(f"factor_{PRIMARY_MODEL}", baseline_count)][:, indices]
+            hgb_div_rmse = float(np.sqrt(np.mean(
+                ((actual_scope-hgb_scope) * label_dlogS[:, None]) ** 2)))
             beta_error = actual_scope - predicted_scope
             predicted_div = -predicted_scope * label_dlogS[:, None]
             div_error = actual_div - predicted_div
@@ -458,6 +526,10 @@ def _surface_summary(factor_predictions: pd.DataFrame,
                     if baseline_sse > 0.0 else np.nan),
                 "dIV_rmse": div_rmse,
                 "dIV_mae": float(np.mean(np.abs(div_error))),
+                "dIV_rmse_improvement_vs_training_mean_surface": (
+                    1.0 - div_rmse / mean_div_rmse if mean_div_rmse > 0 else np.nan),
+                "dIV_rmse_improvement_vs_hgb_same_factor_count": (
+                    1.0 - div_rmse / hgb_div_rmse if hgb_div_rmse > 0 else np.nan),
                 "dIV_rmse_improvement_vs_last_factor": (
                     1.0 - div_rmse / naive_rmse
                     if naive_rmse > 0.0 else np.nan),
@@ -471,13 +543,18 @@ def _surface_summary(factor_predictions: pd.DataFrame,
 def run_step6(factor_state_panel: pd.DataFrame,
               factor_loadings: pd.DataFrame,
               daily_beta: pd.DataFrame,
-              config: DynamicAlphaConfig = DynamicAlphaConfig()) -> Step6Result:
+              config: DynamicAlphaConfig = DynamicAlphaConfig(), *,
+              hgb_parameters: dict | None = None,
+              include_catboost: bool = False,
+              catboost_parameters: dict | None = None) -> Step6Result:
     """Forecast the next three factors and compare nested beta surfaces."""
     schema = validate_factor_pair(factor_state_panel, factor_loadings, config)
     prediction_features = (*STATE_FEATURES, *schema.last)
     loadings = _ordered_loadings(factor_loadings, config)
     sample = _prediction_panel(factor_state_panel)
-    predictions, importance, ridge_alphas = _fit_models(sample)
+    predictions, importance, ridge_alphas = _fit_models(
+        sample, hgb_parameters=hgb_parameters, include_catboost=include_catboost,
+        catboost_parameters=catboost_parameters)
     factor_summary = _factor_summary(predictions)
     surface_summary = _surface_summary(
         predictions, loadings, daily_beta, config)
@@ -508,6 +585,19 @@ def run_step6(factor_state_panel: pd.DataFrame,
         "label_leakage_columns_in_feature_set": [],
         "split_policy": "reuse Step 4 train/test label assignment; no shuffle",
         "primary_model": PRIMARY_MODEL,
+        "compared_models": list(predictions["model"].unique()),
+        "nonlinear_model_parameters": {
+            PRIMARY_MODEL: factor_model(PRIMARY_MODEL, hgb_parameters).get_params(),
+            **({"catboost": CATBOOST_DEFAULTS | dict(catboost_parameters or {})}
+               if include_catboost else {}),
+        },
+        "comparison_policy": (
+            "same close-t features, label dates, fixed Step4 basis and surface "
+            "scopes; HGB/CatBoost use fixed settings and the recorded losses, no test "
+            "eval_set or early stopping; no automatic winner selection"),
+        "feature_importance_policy": (
+            "test-set permutation MSE increase, 10 repeats for each nonlinear "
+            "model; exploratory only, not a feature-selection holdout"),
         "ridge_alphas": ridge_alphas,
         "factor_oos_r_squared": {f: float(primary_factors.loc[f, "oos_r_squared_vs_training_mean"])
                                  for f in schema.scores},
@@ -526,6 +616,26 @@ def run_step6(factor_state_panel: pd.DataFrame,
         "step7_note": (
             "Beta-to-alpha inversion and delta backtesting remain downstream"),
     }
+    if include_catboost:
+        import catboost
+        validation["catboost_version"] = catboost.__version__
+    validation["nonlinear_model_comparison"] = {}
+    for model in importance["model"].unique():
+        factors = factor_summary[factor_summary.model.eq(model)]
+        surfaces = surface_summary[surface_summary.scope.eq("overall")
+                                   & surface_summary.model.eq(f"factor_{model}")]
+        validation["nonlinear_model_comparison"][model] = {
+            "factor_oos_r_squared_vs_training_mean": dict(zip(
+                factors.factor, factors.oos_r_squared_vs_training_mean)),
+            "factor_oos_r_squared_vs_last_observed_factor": dict(zip(
+                factors.factor, factors.oos_r_squared_vs_last_observed_factor)),
+            "surface_dIV_rmse_by_factor_count": {
+                str(int(r.factor_count)): float(r.dIV_rmse)
+                for r in surfaces.itertuples()},
+            "surface_dIV_improvement_vs_last_factor": {
+                str(int(r.factor_count)): float(r.dIV_rmse_improvement_vs_last_factor)
+                for r in surfaces.itertuples()},
+        }
     if schema.method == "atm_anchored":
         validation.update(
             atm_factor_oos_r_squared=validation["factor_oos_r_squared"]["atm_beta_factor"],
@@ -553,15 +663,19 @@ def _save_plots(result: Step6Result, target: Path) -> list[str]:
         return []
 
     files: list[str] = []
+    nonlinear_names = list(result.feature_importance["model"].unique())
     primary = result.factor_predictions[
-        result.factor_predictions["model"].eq(PRIMARY_MODEL)]
+        result.factor_predictions["model"].isin(nonlinear_names)]
     fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
     for ax, factor in zip(axes, schema_for(result.config.step4_factor_method).scores):
         data = primary[primary["factor"].eq(factor)]
-        dates = pd.to_datetime(data["label_date"])
-        ax.plot(dates, data["actual_factor"], label="actual", linewidth=1)
-        ax.plot(dates, data["predicted_factor"], label="predicted",
-                linewidth=1)
+        actual = data[data.model.eq(PRIMARY_MODEL)]
+        ax.plot(pd.to_datetime(actual.label_date), actual.actual_factor,
+                label="actual", linewidth=1)
+        for name in nonlinear_names:
+            predicted = data[data.model.eq(name)]
+            ax.plot(pd.to_datetime(predicted.label_date), predicted.predicted_factor,
+                    label=name, linewidth=1)
         ax.set_ylabel(factor)
     axes[0].legend(fontsize=8)
     axes[-1].set_xlabel("label date")
@@ -572,20 +686,27 @@ def _save_plots(result: Step6Result, target: Path) -> list[str]:
     plt.close(fig)
     files.append(name)
 
-    factor_skill = result.factor_model_summary[
-        result.factor_model_summary["model"].eq(PRIMARY_MODEL)]
-    surface_skill = result.surface_model_summary[
-        result.surface_model_summary["scope"].eq("overall")
-        & result.surface_model_summary["model"].eq(
-            f"factor_{PRIMARY_MODEL}")]
+    model_names = ["ridge_state", *nonlinear_names]
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    axes[0].bar(factor_skill["factor"],
-                factor_skill["oos_r_squared_vs_training_mean"])
+    factors = schema_for(result.config.step4_factor_method).scores
+    width = .8 / len(model_names)
+    for i, name in enumerate(model_names):
+        factor_skill = result.factor_model_summary[
+            result.factor_model_summary.model.eq(name)].set_index("factor").reindex(factors)
+        surface_skill = result.surface_model_summary[
+            result.surface_model_summary.scope.eq("overall")
+            & result.surface_model_summary.model.eq(f"factor_{name}")
+        ].set_index("factor_count").reindex([1, 2, 3])
+        offset = (i - (len(model_names) - 1) / 2) * width
+        axes[0].bar(np.arange(3) + offset,
+                    factor_skill.oos_r_squared_vs_training_mean, width, label=name)
+        axes[1].bar(np.arange(1, 4) + offset,
+                    surface_skill.dIV_rmse_improvement_vs_last_factor, width, label=name)
+    axes[0].set_xticks(np.arange(3), factors)
+    axes[0].legend(fontsize=7)
     axes[0].axhline(0.0, color="black", linewidth=0.8)
     axes[0].tick_params(axis="x", rotation=20)
     axes[0].set(ylabel="OOS R-squared", title="Factor forecast skill")
-    axes[1].bar(surface_skill["factor_count"],
-                surface_skill["dIV_rmse_improvement_vs_last_factor"])
     axes[1].axhline(0.0, color="black", linewidth=0.8)
     axes[1].set(xticks=(1, 2, 3), xlabel="factor count",
                 ylabel="dIV RMSE improvement",
